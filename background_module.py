@@ -813,3 +813,7 @@ def gl_draw_solar_panels(screen, panel_renderer, panel_df, panel_coverage, power
 
 # Alias for compatibility with main.py
 setup_background_fast = setup_background
+
+def setup_background_fast(screen, width, height, x_range, y_range, grid_color=(204, 204, 204)):
+    """Alias for setup_background with optimized parameters"""
+    return setup_background(screen, width, height, x_range, y_range, grid_color)
