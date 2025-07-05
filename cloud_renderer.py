@@ -47,7 +47,6 @@ def create_cloud_surface(ellipse_params, domain_size, area_size_km, width, heigh
         cx, cy, cw, ch, crot, cop = ellipse_params
         altitude = 1.0
         cloud_type = "cumulus"
-    
     # Convert to km
     cx_km = cx / domain_size * area_size_km
     cy_km = cy / domain_size * area_size_km
