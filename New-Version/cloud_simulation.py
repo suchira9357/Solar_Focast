@@ -108,18 +108,14 @@ class UltraOptimizedCloudParcel:
         # State flags
         'flag_for_split', 'split_fading',
         # Cached data
-        '_preset', '_trail', '_last_ellipse_cache', '_shape_cache_key'
+        '_preset', '_trail', '_last_ellipse_cache', '_shape_cache_key',
+        '_cached_max_age'  # <-- Added for caching max_age
     )
     
-    def __init__(self, x: float, y: float, ctype: str):
-        import inspect
-        # Defensive check for extra arguments
-        frame = inspect.currentframe()
-        args, _, _, values = inspect.getargvalues(frame)
-        if len(values) > 4:  # self, x, y, ctype
-            print(f"[ERROR] UltraOptimizedCloudParcel.__init__ received too many arguments: {values}")
-            raise TypeError(f"UltraOptimizedCloudParcel.__init__() takes 4 positional arguments but {len(values)} were given: {values}")
-        print(f"[DEBUG] UltraOptimizedCloudParcel.__init__ called with args: {values}")
+    def __init__(self, x: float, y: float, ctype: str, wind=None):
+        # Backward compatibility: if ctype is not a string, swap with wind
+        if not isinstance(ctype, str) and isinstance(wind, str):
+            ctype, wind = wind, ctype
         # Position
         self.x, self.y = x, y
         self.prev_x, self.prev_y = x, y
@@ -180,6 +176,16 @@ class UltraOptimizedCloudParcel:
                                   cache['stable_frames'] + 
                                   cache['decay_frames'])
         return self._cached_max_age
+    
+    @property
+    def growth_frames(self) -> int:
+        """Expose growth_frames for compatibility with external code."""
+        return self._lifecycle_cache['growth_frames']
+    
+    @property
+    def wind(self):
+        """Expose wind for compatibility with external code. Returns None by default."""
+        return None
     
     def _get_lifecycle_factors(self) -> Tuple[float, float]:
         """Optimized lifecycle factor calculation with caching."""
@@ -356,6 +362,12 @@ class OptimizedWeatherSystem:
     
     def step(self, dt: Optional[float] = None, t: Optional[float] = None, t_s: Optional[float] = None) -> None:
         """Optimized step with batch processing and caching."""
+        # --- HARD LIMIT ON PARCELS ---
+        MAX_TOTAL_PARCELS = 100
+        if len(self.parcels) > MAX_TOTAL_PARCELS:
+            print(f"[WARNING] Parcel count exceeded {MAX_TOTAL_PARCELS}, trimming to limit.")
+            self.parcels = self.parcels[:MAX_TOTAL_PARCELS]
+        
         # Update simulation time
         if t_s is not None:
             self.sim_time = t_s
@@ -443,7 +455,7 @@ class OptimizedWeatherSystem:
         return child
     
     def _handle_spawning(self) -> None:
-        """Optimized spawning logic with caching."""
+        """Optimized spawning logic with enforced 20s interval."""
         # Single cloud mode check
         if getattr(CFG, 'SINGLE_CLOUD_MODE', False):
             if len(self.parcels) == 0:
@@ -451,23 +463,18 @@ class OptimizedWeatherSystem:
                 self.time_since_last_spawn = 0.0
             return
         
-        # Regular spawning with cached parameters
+        # Regular spawning with enforced 20s interval
         max_parcels = getattr(CFG, 'MAX_PARCELS', 6)
         spawn_probability = getattr(CFG, 'SPAWN_PROBABILITY', 0.2)
-        min_spawn_interval = getattr(CFG, 'MIN_SPAWN_INTERVAL', 10.0)
-        
-        can_spawn = self.time_since_last_spawn > min_spawn_interval
-        should_spawn = (can_spawn and 
-                       len(self.parcels) < max_parcels and 
-                       (random.random() < spawn_probability or len(self.parcels) == 0))
+        min_spawn_interval = 20.0  # Enforce 20 seconds between spawns
+        can_spawn = self.time_since_last_spawn >= min_spawn_interval
+        should_spawn = (
+            can_spawn and
+            len(self.parcels) < max_parcels and
+            (random.random() < spawn_probability or len(self.parcels) == 0)
+        )
         
         if should_spawn:
-            self._spawn()
-            self.time_since_last_spawn = 0.0
-        
-        # Force spawn if needed
-        if (len(self.parcels) == 0 and 
-            getattr(CFG, 'FORCE_INITIAL_CLOUD', False)):
             self._spawn()
             self.time_since_last_spawn = 0.0
     
