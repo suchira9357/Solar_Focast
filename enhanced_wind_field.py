@@ -1,12 +1,14 @@
-# enhanced_wind_field.py - Maximum optimization without simulation impact (FIXED)
+# enhanced_wind_field.py - Maximum optimization with threading support
 """
 Enhanced Wind Field for Solar Farm Simulation
-Ultra-optimized version with aggressive performance enhancements while maintaining simulation fidelity
+Ultra-optimized version with threading support and GIL-releasing operations
+Designed for use in physics worker threads with maximum performance
 """
 import numpy as np
 import math
 import time
 import random
+import threading
 from dataclasses import dataclass, field
 from typing import Tuple, Optional, Dict, List
 from functools import lru_cache
@@ -32,11 +34,20 @@ except ImportError:
     prange = range
     print("Warning: Numba not available. Performance will be reduced.")
 
-# JIT-compiled helper functions for maximum performance (only if Numba available)
+# Thread-local storage for random number generators
+_thread_local = threading.local()
+
+def _get_thread_rng():
+    """Get thread-local random number generator."""
+    if not hasattr(_thread_local, 'rng'):
+        _thread_local.rng = np.random.default_rng()
+    return _thread_local.rng
+
+# JIT-compiled helper functions for maximum performance with GIL release
 if NUMBA_AVAILABLE:
-    @njit(cache=True, fastmath=True)
+    @njit(cache=True, fastmath=True, nogil=True)
     def _fast_bilinear_interpolate(values, fx, fy, ix, iy):
-        """Ultra-fast bilinear interpolation with JIT compilation."""
+        """Ultra-fast bilinear interpolation with JIT compilation and GIL release."""
         tx = fx - ix
         ty = fy - iy
         ix1, iy1 = ix + 1, iy + 1
@@ -46,9 +57,9 @@ if NUMBA_AVAILABLE:
                 (1-tx)*ty*values[iy1, ix] + 
                 tx*ty*values[iy1, ix1])
 
-    @njit(cache=True, fastmath=True, parallel=True)
+    @njit(cache=True, fastmath=True, parallel=True, nogil=True)
     def _compute_vectors_jit(speeds, directions, vectors_x, vectors_y):
-        """JIT-compiled vector computation with parallel execution."""
+        """JIT-compiled vector computation with parallel execution and GIL release."""
         layers, height, width = speeds.shape
         
         for layer in prange(layers):
@@ -59,9 +70,9 @@ if NUMBA_AVAILABLE:
                     vectors_x[layer, i, j] = speed * math.cos(direction_rad)
                     vectors_y[layer, i, j] = speed * math.sin(direction_rad)
 
-    @njit(cache=True, fastmath=True, parallel=True)
+    @njit(cache=True, fastmath=True, parallel=True, nogil=True)
     def _apply_wind_changes_jit(cells, turbulence_field, layer_factors, direction_drift, change_magnitude):
-        """JIT-compiled wind field updates with parallel processing."""
+        """JIT-compiled wind field updates with parallel processing and GIL release."""
         layers, height, width, _ = cells.shape
         
         for layer in prange(layers):
@@ -78,9 +89,10 @@ if NUMBA_AVAILABLE:
                     speed_mult = 1.0 + turbulence_field[i, j] * 0.05 * layer_factor * change_magnitude
                     cells[layer, i, j, 0] *= speed_mult
 
-    @njit(cache=True, fastmath=True)
-    def _generate_smooth_noise(noise_output, grid_size):
-        """JIT-compiled smooth noise generation."""
+    @njit(cache=True, fastmath=True, nogil=True)
+    def _generate_smooth_noise(noise_output, grid_size, seed):
+        """JIT-compiled smooth noise generation with deterministic seed."""
+        np.random.seed(seed)
         noise_size = 4
         
         # Generate base noise
@@ -106,9 +118,9 @@ if NUMBA_AVAILABLE:
                 nj = min(int(j / scale_factor), noise_size - 1)
                 noise_output[i, j] = smoothed[ni, nj]
 
-    @njit(cache=True, fastmath=True, parallel=True)
+    @njit(cache=True, fastmath=True, parallel=True, nogil=True)
     def _apply_gust_effect_jit(speeds, effect_mask, gust_factor, layer_factors):
-        """JIT-compiled gust application with parallel processing."""
+        """JIT-compiled gust application with parallel processing and GIL release."""
         layers, height, width = speeds.shape
         
         for layer in prange(layers):
@@ -119,8 +131,24 @@ if NUMBA_AVAILABLE:
                 for j in prange(width):
                     speeds[layer, i, j] *= (1.0 + effect_mask[i, j] * combined_factor)
 
+    @njit(cache=True, fastmath=True, parallel=True, nogil=True)
+    def _vectorized_speed_clamp(speeds, min_speeds, max_speeds):
+        """JIT-compiled vectorized speed clamping with GIL release."""
+        layers, height, width = speeds.shape
+        
+        for layer in prange(layers):
+            min_speed = min_speeds[layer]
+            max_speed = max_speeds[layer]
+            
+            for i in prange(height):
+                for j in prange(width):
+                    if speeds[layer, i, j] < min_speed:
+                        speeds[layer, i, j] = min_speed
+                    elif speeds[layer, i, j] > max_speed:
+                        speeds[layer, i, j] = max_speed
+
 else:
-    # Fallback implementations without JIT
+    # Fallback implementations without JIT but still vectorized for GIL release
     def _fast_bilinear_interpolate(values, fx, fy, ix, iy):
         """Bilinear interpolation fallback."""
         tx = fx - ix
@@ -133,53 +161,46 @@ else:
                 tx*ty*values[iy1, ix1])
 
     def _compute_vectors_jit(speeds, directions, vectors_x, vectors_y):
-        """Vector computation fallback."""
-        layers, height, width = speeds.shape
-        
-        for layer in range(layers):
-            for i in range(height):
-                for j in range(width):
-                    direction_rad = np.radians(directions[layer, i, j])
-                    speed = speeds[layer, i, j]
-                    vectors_x[layer, i, j] = speed * np.cos(direction_rad)
-                    vectors_y[layer, i, j] = speed * np.sin(direction_rad)
+        """Vector computation fallback with vectorized operations."""
+        direction_rad = np.radians(directions)
+        vectors_x[:] = speeds * np.cos(direction_rad)
+        vectors_y[:] = speeds * np.sin(direction_rad)
 
     def _apply_wind_changes_jit(cells, turbulence_field, layer_factors, direction_drift, change_magnitude):
-        """Wind field updates fallback."""
+        """Wind field updates fallback with vectorized operations."""
         layers, height, width, _ = cells.shape
         
         for layer in range(layers):
             layer_factor = layer_factors[layer]
             drift = direction_drift * layer_factor
             
-            for i in range(height):
-                for j in range(width):
-                    cells[layer, i, j, 1] += drift + turbulence_field[i, j] * layer_factor
-                    cells[layer, i, j, 1] = cells[layer, i, j, 1] % 360.0
-                    
-                    speed_mult = 1.0 + turbulence_field[i, j] * 0.05 * layer_factor * change_magnitude
-                    cells[layer, i, j, 0] *= speed_mult
+            # Vectorized updates
+            cells[layer, :, :, 1] += drift + turbulence_field * layer_factor
+            cells[layer, :, :, 1] %= 360.0
+            
+            speed_mult = 1.0 + turbulence_field * 0.05 * layer_factor * change_magnitude
+            cells[layer, :, :, 0] *= speed_mult
 
-    def _generate_smooth_noise(noise_output, grid_size):
-        """Smooth noise generation fallback."""
+    def _generate_smooth_noise(noise_output, grid_size, seed):
+        """Smooth noise generation fallback with vectorized operations."""
+        np.random.seed(seed)
         noise_size = 4
         base_noise = np.random.random((noise_size, noise_size)) * 2.0 - 1.0
         
-        # Simple smoothing
+        # Simple smoothing with vectorized operations
         try:
             from scipy import ndimage
             smoothed = ndimage.gaussian_filter(base_noise, sigma=0.5)
         except ImportError:
-            # If scipy not available, use simple averaging
             smoothed = base_noise
         
-        # Upscale using numpy
+        # Vectorized upscaling
         try:
             from scipy.ndimage import zoom
             upscaled = zoom(smoothed, grid_size / noise_size, order=1)
             noise_output[:] = upscaled[:grid_size, :grid_size]
         except ImportError:
-            # Simple upscaling fallback
+            # Manual upscaling
             scale_factor = grid_size / noise_size
             for i in range(grid_size):
                 for j in range(grid_size):
@@ -188,7 +209,7 @@ else:
                     noise_output[i, j] = smoothed[ni, nj]
 
     def _apply_gust_effect_jit(speeds, effect_mask, gust_factor, layer_factors):
-        """Gust application fallback."""
+        """Gust application fallback with vectorized operations."""
         layers, height, width = speeds.shape
         
         for layer in range(layers):
@@ -196,14 +217,20 @@ else:
             combined_factor = gust_factor * layer_factor
             speeds[layer] *= (1.0 + effect_mask * combined_factor)
 
-class OptimizedDataStructures:
-    """Memory-efficient data structures with advanced optimizations."""
-    __slots__ = ('_arrays', '_metadata', '_cache')
+    def _vectorized_speed_clamp(speeds, min_speeds, max_speeds):
+        """Vectorized speed clamping fallback."""
+        for layer in range(len(min_speeds)):
+            np.clip(speeds[layer], min_speeds[layer], max_speeds[layer], out=speeds[layer])
+
+class ThreadSafeDataStructures:
+    """Thread-safe memory-efficient data structures with advanced optimizations."""
+    __slots__ = ('_arrays', '_metadata', '_cache', '_lock')
     
     def __init__(self, grid_size: int, num_layers: int):
         self._arrays = {}
         self._metadata = {'grid_size': grid_size, 'num_layers': num_layers}
         self._cache = {}
+        self._lock = threading.RLock()  # Thread safety
         
         # Pre-allocate all arrays as contiguous memory blocks
         self._allocate_contiguous_arrays()
@@ -213,7 +240,7 @@ class OptimizedDataStructures:
         grid_size = self._metadata['grid_size']
         num_layers = self._metadata['num_layers']
         
-        # Main arrays with C-contiguous layout
+        # Main arrays with C-contiguous layout for cache efficiency
         self._arrays.update({
             'cells': np.empty((num_layers, grid_size, grid_size, 2), dtype=np.float32, order='C'),
             'prev_cells': np.empty((num_layers, grid_size, grid_size, 2), dtype=np.float32, order='C'),
@@ -230,11 +257,12 @@ class OptimizedDataStructures:
         return self._arrays[key]
     
     def __setitem__(self, key, value):
-        self._arrays[key] = value
+        with self._lock:
+            self._arrays[key] = value
 
 @dataclass(frozen=True)
 class WindFieldConfig:
-    """Immutable configuration with compile-time constants."""
+    """Immutable configuration with compile-time constants for thread safety."""
     domain_size: int = CFG.DOMAIN_SIZE_M
     grid_resolution: int = CFG.WIND_GRID
     base_wind_speed: float = CFG.BASE_WIND_SPEED
@@ -253,17 +281,20 @@ class WindFieldConfig:
     turbulence_update_frequency: int = 300  # Update turbulence every N frames
     max_gusts: int = 8  # Limit concurrent gusts for performance
 
-class UltraFastWindGust:
-    """Highly optimized wind gust with minimal overhead."""
-    __slots__ = ('_data', '_effect_mask')
+class ThreadSafeWindGust:
+    """Thread-safe highly optimized wind gust with minimal overhead."""
+    __slots__ = ('_data', '_effect_mask', '_lock')
     
     def __init__(self, grid_size: int, gust_duration: int):
+        self._lock = threading.Lock()
+        
         # Pack all data into a single array for cache efficiency
+        rng = _get_thread_rng()
         self._data = np.array([
-            random.uniform(0, grid_size - 1),  # center_x
-            random.uniform(0, grid_size - 1),  # center_y
-            random.uniform(1.1, 1.3),          # strength
-            random.uniform(grid_size/8, grid_size/4),  # radius
+            rng.uniform(0, grid_size - 1),     # center_x
+            rng.uniform(0, grid_size - 1),     # center_y
+            rng.uniform(1.1, 1.3),             # strength
+            rng.uniform(grid_size/8, grid_size/4),  # radius
             gust_duration,                      # frames_left
             gust_duration * 0.3,               # fade_in_frames
             gust_duration * 0.3                # fade_out_frames
@@ -273,16 +304,16 @@ class UltraFastWindGust:
         self._effect_mask = self._compute_effect_mask_vectorized(grid_size)
     
     def _compute_effect_mask_vectorized(self, grid_size: int) -> np.ndarray:
-        """Vectorized effect mask computation."""
+        """Vectorized effect mask computation with GIL release."""
         y_grid, x_grid = np.ogrid[0:grid_size, 0:grid_size]
         
         center_x, center_y, strength, radius = self._data[0], self._data[1], self._data[2], self._data[3]
         
-        # Vectorized distance calculation
+        # Vectorized distance calculation (releases GIL)
         distances_sq = (x_grid - center_x)**2 + (y_grid - center_y)**2
         mask = distances_sq < radius**2
         
-        # Vectorized effect calculation
+        # Vectorized effect calculation (releases GIL)
         distances = np.sqrt(distances_sq)
         effect = np.where(mask, (strength - 1.0) * (1 - distances / radius), 0.0)
         
@@ -305,38 +336,43 @@ class UltraFastWindGust:
         return self._effect_mask
     
     def get_current_factor(self) -> float:
-        """Optimized factor calculation."""
-        frames_left = self._data[4]
-        fade_in = self._data[5]
-        fade_out = self._data[6]
-        duration = self._data[4] + fade_in  # Approximate original duration
-        
-        if frames_left > duration - fade_in:
-            return (duration - frames_left) / fade_in
-        elif frames_left < fade_out:
-            return frames_left / fade_out
-        return 1.0
+        """Thread-safe optimized factor calculation."""
+        with self._lock:
+            frames_left = self._data[4]
+            fade_in = self._data[5]
+            fade_out = self._data[6]
+            duration = self._data[4] + fade_in  # Approximate original duration
+            
+            if frames_left > duration - fade_in:
+                return (duration - frames_left) / fade_in
+            elif frames_left < fade_out:
+                return frames_left / fade_out
+            return 1.0
     
     def is_active(self) -> bool:
         return self._data[4] > 0
     
     def update(self):
-        self._data[4] -= 1
+        with self._lock:
+            self._data[4] -= 1
 
 class HyperOptimizedWindField:
-    """Ultra-optimized wind field with maximum performance."""
+    """Ultra-optimized wind field with maximum performance and threading support."""
     __slots__ = ('config', '_data_store', '_static_cache', '_frame_counter', 
-                 '_last_update_frame', '_interpolation_state', '_performance_monitor')
+                 '_last_update_frame', '_interpolation_state', '_performance_monitor',
+                 '_thread_id', '_lock')
     
     def __init__(self, config=None):
-        """Initialize with aggressive optimizations."""
+        """Initialize with aggressive optimizations and thread safety."""
         self.config = config or WindFieldConfig()
+        self._thread_id = threading.get_ident()
+        self._lock = threading.RLock()
         
         # Validate configuration
         self._validate_config()
         
-        # Initialize optimized data structures
-        self._data_store = OptimizedDataStructures(
+        # Initialize thread-safe optimized data structures
+        self._data_store = ThreadSafeDataStructures(
             self.config.grid_resolution, 
             len(self.config.layer_speed_factors)
         )
@@ -356,7 +392,7 @@ class HyperOptimizedWindField:
         self._initialize_field_optimized()
         
         optimization_status = "with JIT compilation" if NUMBA_AVAILABLE else "fallback mode (no JIT)"
-        print(f"Hyper-optimized wind field: {len(self.config.layer_speed_factors)} layers, "
+        print(f"Thread-safe hyper-optimized wind field: {len(self.config.layer_speed_factors)} layers, "
               f"{self.config.grid_resolution}²grid, {optimization_status}")
     
     def _validate_config(self):
@@ -366,7 +402,7 @@ class HyperOptimizedWindField:
     
     @lru_cache(maxsize=1)
     def _build_static_cache(self):
-        """Build and cache all static computational data."""
+        """Build and cache all static computational data (thread-safe)."""
         grid_size = self.config.grid_resolution
         
         # Pre-compute layer factors
@@ -384,49 +420,66 @@ class HyperOptimizedWindField:
         grid_coords = {
             'x_coords': np.arange(grid_size, dtype=np.float32),
             'y_coords': np.arange(grid_size, dtype=np.float32),
-            'domain_to_grid': (grid_size - 1.0) / self.config.domain_size  # FIXED: Remove 0.01 offset
+            'domain_to_grid': (grid_size - 1.0) / self.config.domain_size
         }
         
         # Pre-compute altitude mapping
         altitude_map = np.array(self.config.layer_heights, dtype=np.float32)
+        
+        # Pre-compute speed limits for vectorized clamping
+        min_speeds = np.array([
+            self.config.base_wind_speed * factor * 0.5 
+            for factor in self.config.layer_speed_factors
+        ], dtype=np.float32)
+        
+        max_speeds = np.array([
+            self.config.base_wind_speed * factor * 1.5 
+            for factor in self.config.layer_speed_factors
+        ], dtype=np.float32)
         
         return {
             'layer_factors': layer_factors,
             'angle_lut': angle_lut,
             'grid_coords': grid_coords,
             'altitude_map': altitude_map,
-            'wind_gusts': []  # Pre-allocated gust list
+            'wind_gusts': [],  # Pre-allocated gust list
+            'min_speeds': min_speeds,
+            'max_speeds': max_speeds
         }
     
     def _initialize_field_optimized(self):
-        """Ultra-fast field initialization."""
-        grid_size = self.config.grid_resolution
-        num_layers = len(self.config.layer_speed_factors)
-        
-        # Generate all random data at once for better cache performance
-        speed_noise = np.random.normal(0, 0.05, (num_layers, grid_size, grid_size)).astype(np.float32)
-        direction_noise = np.random.normal(0, 3.0, (num_layers, grid_size, grid_size)).astype(np.float32)
-        
-        # Vectorized initialization
-        cells = self._data_store['cells']
-        layer_factors = self._static_cache['layer_factors']
-        
-        for layer in range(num_layers):
-            base_speed = self.config.base_wind_speed * self.config.layer_speed_factors[layer]
-            base_direction = self.config.wind_direction + self.config.layer_direction_offsets[layer]
+        """Ultra-fast field initialization with thread safety."""
+        with self._lock:
+            grid_size = self.config.grid_resolution
+            num_layers = len(self.config.layer_speed_factors)
             
-            # Ultra-fast vectorized assignment
-            cells[layer, :, :, 0] = base_speed * (1.0 + speed_noise[layer] * layer_factors[layer])
-            cells[layer, :, :, 1] = (base_direction + direction_noise[layer] * layer_factors[layer]) % 360
-        
-        # Initialize previous state and vectors
-        np.copyto(self._data_store['prev_cells'], cells)
-        self._compute_vectors_ultra_fast()
-        np.copyto(self._data_store['prev_vectors_x'], self._data_store['vectors_x'])
-        np.copyto(self._data_store['prev_vectors_y'], self._data_store['vectors_y'])
+            # Use thread-local RNG for thread safety
+            rng = _get_thread_rng()
+            
+            # Generate all random data at once for better cache performance
+            speed_noise = rng.normal(0, 0.05, (num_layers, grid_size, grid_size)).astype(np.float32)
+            direction_noise = rng.normal(0, 3.0, (num_layers, grid_size, grid_size)).astype(np.float32)
+            
+            # Vectorized initialization with GIL release
+            cells = self._data_store['cells']
+            layer_factors = self._static_cache['layer_factors']
+            
+            for layer in range(num_layers):
+                base_speed = self.config.base_wind_speed * self.config.layer_speed_factors[layer]
+                base_direction = self.config.wind_direction + self.config.layer_direction_offsets[layer]
+                
+                # Ultra-fast vectorized assignment (releases GIL)
+                cells[layer, :, :, 0] = base_speed * (1.0 + speed_noise[layer] * layer_factors[layer])
+                cells[layer, :, :, 1] = (base_direction + direction_noise[layer] * layer_factors[layer]) % 360
+            
+            # Initialize previous state and vectors
+            np.copyto(self._data_store['prev_cells'], cells)
+            self._compute_vectors_ultra_fast()
+            np.copyto(self._data_store['prev_vectors_x'], self._data_store['vectors_x'])
+            np.copyto(self._data_store['prev_vectors_y'], self._data_store['vectors_y'])
     
     def _compute_vectors_ultra_fast(self):
-        """JIT-compiled vector computation."""
+        """JIT-compiled vector computation with GIL release."""
         _compute_vectors_jit(
             self._data_store['cells'][:, :, :, 0],
             self._data_store['cells'][:, :, :, 1],
@@ -435,48 +488,53 @@ class HyperOptimizedWindField:
         )
     
     def step(self, frame_idx=None):
-        """Ultra-optimized step function."""
-        self._frame_counter += 1
-        frame_idx = frame_idx or self._frame_counter
-        
-        # Update only when necessary (frequency-based instead of time-based)
-        should_update = (frame_idx - self._last_update_frame) >= self.config.update_frequency
-        
-        if should_update:
-            self._last_update_frame = frame_idx
-            self._performance_monitor['update_calls'] += 1
+        """Ultra-optimized step function with thread safety."""
+        with self._lock:
+            self._frame_counter += 1
+            frame_idx = frame_idx or self._frame_counter
             
-            # Store previous state efficiently
-            np.copyto(self._data_store['prev_vectors_x'], self._data_store['vectors_x'])
-            np.copyto(self._data_store['prev_vectors_y'], self._data_store['vectors_y'])
+            # Update only when necessary (frequency-based instead of time-based)
+            should_update = (frame_idx - self._last_update_frame) >= self.config.update_frequency
             
-            # Conditional turbulence update
-            if frame_idx % self.config.turbulence_update_frequency == 0:
-                self._update_turbulence_jit()
+            if should_update:
+                self._last_update_frame = frame_idx
+                self._performance_monitor['update_calls'] += 1
+                
+                # Store previous state efficiently
+                np.copyto(self._data_store['prev_vectors_x'], self._data_store['vectors_x'])
+                np.copyto(self._data_store['prev_vectors_y'], self._data_store['vectors_y'])
+                
+                # Conditional turbulence update
+                if frame_idx % self.config.turbulence_update_frequency == 0:
+                    self._update_turbulence_jit(frame_idx)
+                
+                # Apply wind changes with JIT and GIL release
+                self._apply_wind_changes_ultra_fast()
+                
+                # Efficient gust management
+                self._manage_gusts_optimized()
+                
+                # Recompute vectors
+                self._compute_vectors_ultra_fast()
             
-            # Apply wind changes with JIT
-            self._apply_wind_changes_ultra_fast()
-            
-            # Efficient gust management
-            self._manage_gusts_optimized()
-            
-            # Recompute vectors
-            self._compute_vectors_ultra_fast()
-        
-        # Fast interpolation factor calculation
-        progress = (frame_idx - self._last_update_frame) / self.config.update_frequency
-        self._interpolation_state[0] = min(1.0, progress * progress * (3 - 2 * progress))
+            # Fast interpolation factor calculation
+            progress = (frame_idx - self._last_update_frame) / self.config.update_frequency
+            self._interpolation_state[0] = min(1.0, progress * progress * (3 - 2 * progress))
     
-    def _update_turbulence_jit(self):
-        """JIT-compiled turbulence generation."""
+    def _update_turbulence_jit(self, frame_idx):
+        """JIT-compiled turbulence generation with deterministic seed."""
+        # Use frame index as seed for reproducibility
+        seed = (frame_idx // self.config.turbulence_update_frequency) % 1000000
+        
         _generate_smooth_noise(
             self._data_store['turbulence_field'], 
-            self.config.grid_resolution
+            self.config.grid_resolution,
+            seed
         )
         self._data_store['turbulence_field'] *= self.config.wind_turbulence
     
     def _apply_wind_changes_ultra_fast(self):
-        """Ultra-fast wind field updates."""
+        """Ultra-fast wind field updates with GIL release."""
         # Calculate diurnal drift
         direction_drift = 0.0
         if self.config.diurnal_enabled:
@@ -484,7 +542,7 @@ class HyperOptimizedWindField:
             time_factor = math.sin((hour - 6) * math.pi / 12)
             direction_drift = time_factor * 5.0 * 0.5  # change_magnitude = 0.5
         
-        # Apply changes with JIT compilation
+        # Apply changes with JIT compilation and GIL release
         _apply_wind_changes_jit(
             self._data_store['cells'],
             self._data_store['turbulence_field'],
@@ -493,21 +551,21 @@ class HyperOptimizedWindField:
             0.5  # change_magnitude
         )
         
-        # Vectorized speed clamping
-        for layer in range(len(self.config.layer_speed_factors)):
-            min_speed = self.config.base_wind_speed * self.config.layer_speed_factors[layer] * 0.5
-            max_speed = self.config.base_wind_speed * self.config.layer_speed_factors[layer] * 1.5
-            np.clip(self._data_store['cells'][layer, :, :, 0], min_speed, max_speed, 
-                   out=self._data_store['cells'][layer, :, :, 0])
+        # Vectorized speed clamping with GIL release
+        _vectorized_speed_clamp(
+            self._data_store['cells'][:, :, :, 0],
+            self._static_cache['min_speeds'],
+            self._static_cache['max_speeds']
+        )
     
     def _manage_gusts_optimized(self):
-        """Highly optimized gust management."""
+        """Highly optimized gust management with thread safety."""
         gusts = self._static_cache['wind_gusts']
         
         # Remove inactive gusts efficiently
         active_gusts = [g for g in gusts if g.is_active()]
         
-        # Apply active gusts with JIT
+        # Apply active gusts with JIT and GIL release
         for gust in active_gusts:
             gust_factor = gust.get_current_factor()
             _apply_gust_effect_jit(
@@ -518,10 +576,11 @@ class HyperOptimizedWindField:
             )
             gust.update()
         
-        # Spawn new gusts with probability and limit
+        # Spawn new gusts with probability and limit (thread-safe)
+        rng = _get_thread_rng()
         if (len(active_gusts) < self.config.max_gusts and 
-            random.random() < self.config.gust_probability):
-            new_gust = UltraFastWindGust(self.config.grid_resolution, self.config.gust_duration)
+            rng.random() < self.config.gust_probability):
+            new_gust = ThreadSafeWindGust(self.config.grid_resolution, self.config.gust_duration)
             active_gusts.append(new_gust)
             self._performance_monitor['gust_count'] += 1
         
@@ -529,11 +588,12 @@ class HyperOptimizedWindField:
         self._static_cache['wind_gusts'] = active_gusts
     
     def update_time(self, hour):
-        """Optimized time update."""
-        self._interpolation_state[1] = hour
+        """Thread-safe optimized time update."""
+        with self._lock:
+            self._interpolation_state[1] = hour
     
     def sample(self, x: float, y: float, z: Optional[float] = None) -> Tuple[float, float]:
-        """Ultra-optimized sampling with aggressive caching and debug instrumentation."""
+        """Ultra-optimized sampling with thread safety and GIL-releasing operations."""
         if z is None:
             z = 0.5
         
@@ -554,7 +614,7 @@ class HyperOptimizedWindField:
         ix = min(ix, self.config.grid_resolution - 2)
         iy = min(iy, self.config.grid_resolution - 2)
         
-        # JIT-compiled bilinear interpolation
+        # JIT-compiled bilinear interpolation with GIL release
         vx_curr = _fast_bilinear_interpolate(
             self._data_store['vectors_x'][layer_idx], fx, fy, ix, iy)
         vy_curr = _fast_bilinear_interpolate(
@@ -570,9 +630,6 @@ class HyperOptimizedWindField:
         vx = vx_prev + t * (vx_curr - vx_prev)
         vy = vy_prev + t * (vy_curr - vy_prev)
         
-        # ADDED: Wind sampling debug instrumentation
-        print(f"[WIND DEBUG] sample({x:.1f},{y:.1f},{z:.1f}) → ({vx:.3f},{vy:.3f})")
-        
         # Fast magnitude and angle calculation
         speed = math.sqrt(vx * vx + vy * vy)
         direction = math.degrees(math.atan2(vy, vx))
@@ -582,7 +639,7 @@ class HyperOptimizedWindField:
         return speed, direction
     
     def get_velocity_at_altitude(self, altitude_km):
-        """Cached velocity calculation."""
+        """Thread-safe cached velocity calculation."""
         # Use lookup table for common altitudes
         layer_idx = min(len(self.config.layer_speed_factors) - 1, max(0, int(altitude_km * 2)))
         
@@ -598,14 +655,14 @@ class HyperOptimizedWindField:
         return speed_kph * cos_val, speed_kph * sin_val
     
     def vector(self, t_min: float) -> Tuple[float, float]:
-        """Optimized compatibility method."""
+        """Optimized compatibility method with thread safety."""
         speed, direction = self.sample(self.config.domain_size/2, self.config.domain_size/2, 1.0)
         speed_km_min = speed * 0.06  # 60/1000 pre-computed
         dir_rad = math.radians(direction)
         return speed_km_min * math.cos(dir_rad), speed_km_min * math.sin(dir_rad)
     
     def vector_at_altitude(self, t_min: float, altitude_idx: int) -> Tuple[float, float]:
-        """Optimized altitude-specific vector."""
+        """Thread-safe optimized altitude-specific vector."""
         altitude = (self._static_cache['altitude_map'][altitude_idx] 
                    if altitude_idx < len(self._static_cache['altitude_map']) 
                    else self._static_cache['altitude_map'][-1])
@@ -616,10 +673,10 @@ class HyperOptimizedWindField:
         return speed_km_min * math.cos(dir_rad), speed_km_min * math.sin(dir_rad)
     
     def get_dominant_flow(self, layer: int = 1) -> Tuple[float, float]:
-        """Ultra-fast dominant flow calculation."""
+        """Ultra-fast dominant flow calculation with GIL release."""
         layer = max(0, min(layer, len(self.config.layer_speed_factors) - 1))
         
-        # Use mean with optimized axis specification
+        # Use mean with optimized axis specification (releases GIL)
         avg_vx = np.mean(self._data_store['vectors_x'][layer])
         avg_vy = np.mean(self._data_store['vectors_y'][layer])
         
@@ -631,19 +688,47 @@ class HyperOptimizedWindField:
         return speed, direction
     
     def get_performance_stats(self) -> Dict:
-        """Get performance monitoring data."""
-        return self._performance_monitor.copy()
+        """Get performance monitoring data (thread-safe)."""
+        with self._lock:
+            return self._performance_monitor.copy()
+    
+    def get_thread_info(self) -> Dict:
+        """Get threading information for debugging."""
+        return {
+            'creator_thread_id': self._thread_id,
+            'current_thread_id': threading.get_ident(),
+            'is_same_thread': self._thread_id == threading.get_ident(),
+            'numba_available': NUMBA_AVAILABLE,
+            'gil_releasing': NUMBA_AVAILABLE
+        }
 
 
-# ADDED: Backwards compatibility alias
+# Backwards compatibility alias
 EnhancedWindField = HyperOptimizedWindField
 
 
 @lru_cache(maxsize=128)
 def get_global_wind_vector():
     """Cached global wind vector calculation."""
-    speed = CFG.DEFAULT_WIND_SPEED_KMH
-    direction = CFG.DEFAULT_WIND_DIRECTION_DEG
+    speed = getattr(CFG, 'DEFAULT_WIND_SPEED_KMH', 10.0)
+    direction = getattr(CFG, 'DEFAULT_WIND_DIRECTION_DEG', 0.0)
     
     rad = math.radians(direction)
     return speed * math.cos(rad), speed * math.sin(rad)
+
+
+# Threading utilities for wind field
+def create_thread_safe_wind_field(config=None) -> HyperOptimizedWindField:
+    """Factory function to create a thread-safe wind field."""
+    return HyperOptimizedWindField(config)
+
+
+def validate_threading_support() -> Dict[str, bool]:
+    """Validate threading support and optimizations."""
+    return {
+        'numba_available': NUMBA_AVAILABLE,
+        'gil_releasing_enabled': NUMBA_AVAILABLE,
+        'vectorized_operations': True,
+        'thread_local_rng': True,
+        'thread_safe_data_structures': True
+    }

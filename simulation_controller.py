@@ -1,1204 +1,840 @@
+#!/usr/bin/env python3
+"""
+Simulation Controller - Complete Threading Implementation
+Orchestrates weather, power, shadows with background physics thread support
+
+Threading Architecture:
+┌─────────────────┐    dt     ┌─────────────────┐
+│   Main Thread   │─────────→│  Physics Thread │
+│ (Rendering & I/O)│          │   (Worker)      │
+└─────────────────┘←─────────┐                 │
+         │  result           │                 │
+         └───────────────────┘─────────────────┘
+"""
+import threading
+import traceback
+import logging
+import os
+import json
+import copy
+from typing import Dict, Any, Optional, List, Tuple, Union
+from collections import deque
+from dataclasses import dataclass, field
+from contextlib import contextmanager
+
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Optional
-from dataclasses import dataclass
-import json
-import math
-import random
-import time
-import sim_config as CFG
-import os
-import sys
-from panel_layout import PANELS, build_panel_cells, panel_df
 
-# FIXED: Import OpenGL rendering modules with corrected import paths
+# Import configuration
 try:
-    from panel_renderer import initialize_gl_panel_renderer, gl_draw_solar_panels
-    from ui_renderer import initialize_gl_ui_renderer, gl_create_info_panel
-    from cloud_renderer import initialize_gl_for_pygame, render_gl_clouds, km_to_screen_coords
-    OPENGL_AVAILABLE = True
+    import sim_config as CFG
 except ImportError:
-    OPENGL_AVAILABLE = False
-    print("Warning: OpenGL renderers not available. Using Pygame renderers only.")
+    # Fallback configuration
+    class CFG:
+        PHYSICS_TIMESTEP = 1/60.0
+        DOMAIN_SIZE_M = 10000
+        AREA_SIZE_KM = 10
+        TIME_SCALE = 1.0
 
-# Add SCATTER_PROBABILITY to sim_config if not already there
-if not hasattr(CFG, 'SCATTER_PROBABILITY'):
-    CFG.SCATTER_PROBABILITY = 0.0002
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-class TurbidityModel:
-    """Model atmospheric turbidity variations with caching."""
-    
-    def __init__(self, location: Dict):
-        self.location = location
-        self.base_turbidity = self._get_base_turbidity()
-        
-        # Cache for seasonal factors (computed once per month)
-        self._seasonal_cache = {}
-        self._current_month = None
-        
-    def _get_base_turbidity(self) -> float:
-        """Get base turbidity for location."""
-        # Simplified - could use actual data
-        if self.location['altitude'] > 1000:
-            return 2.0  # Mountain
-        elif abs(self.location['latitude']) > 40:
-            return 2.5  # Temperate
-        else:
-            return 3.5  # Tropical
-            
-    def get_turbidity(self, timestamp: datetime, weather_state) -> float:
-        """Calculate current turbidity with caching."""
-        month = timestamp.month
-        
-        # Check if we need to recompute seasonal factor
-        if month != self._current_month:
-            self._current_month = month
-            self._seasonal_cache[month] = 1 + 0.3 * np.sin((month - 6) * np.pi / 6)
-        
-        seasonal_factor = self._seasonal_cache[month]
-        
-        # Humidity effect
-        humidity_factor = 1 + 0.01 * (weather_state.humidity - 50)
-        
-        # After rain effect
-        rain_factor = 0.7 if weather_state.precipitation > 0 else 1.0
-            
-        turbidity = self.base_turbidity * seasonal_factor * humidity_factor * rain_factor
-        
-        return max(1.5, min(6.0, turbidity))
-
-class CloudModel:
-    """Advanced cloud modeling for weather system."""
-    
-    def __init__(self):
-        self.cloud_database = self._load_cloud_properties()
-        
-    def _load_cloud_properties(self) -> Dict:
-        """Load detailed cloud properties."""
-        return {
-            'cumulus': {
-                'base_height': 500,  # meters
-                'thickness': 1000,
-                'albedo': 0.65,
-                'emissivity': 0.95,
-                'liquid_water_path': 50  # g/m²
-            },
-            'stratus': {
-                'base_height': 200,
-                'thickness': 500,
-                'albedo': 0.60,
-                'emissivity': 0.98,
-                'liquid_water_path': 100
-            },
-            'cirrus': {
-                'base_height': 8000,
-                'thickness': 2000,
-                'albedo': 0.30,
-                'emissivity': 0.50,
-                'liquid_water_path': 5
-            },
-            'cumulonimbus': {
-                'base_height': 500,
-                'thickness': 10000,
-                'albedo': 0.90,
-                'emissivity': 1.0,
-                'liquid_water_path': 500
-            }
-        }
-    
-    def get_cloud_properties(self, cloud_type: str) -> Dict:
-        """Get detailed properties for cloud type."""
-        return self.cloud_database.get(cloud_type, self.cloud_database['cumulus'])
 
 @dataclass
-class WeatherState:
-    """Current weather conditions."""
-    timestamp: datetime
-    temperature: float  # Celsius
-    pressure: float  # hPa
-    humidity: float  # %
-    wind_speed: float  # m/s
-    wind_direction: float  # degrees
-    cloud_cover: float  # fraction (0-1)
-    cloud_type: str
-    visibility: float  # km
-    precipitation: float  # mm/hr
-    solar_radiation: Dict  # DNI, DHI, GHI measurements
-
-class OptimizedWeatherSystem:
-    """
-    Optimized weather system with vectorized operations and caching.
-    """
+class PerformanceMetrics:
+    """Comprehensive performance tracking for simulation controller."""
+    frames_processed: int = 0
+    total_processing_time: float = 0.0
+    avg_frame_time_ms: float = 0.0
+    max_frame_time_ms: float = 0.0
+    min_frame_time_ms: float = float('inf')
     
-    def __init__(self, location: Dict = None, seed=0):
-        """
-        Initialize weather system for specific location.
+    # Threading-specific metrics
+    worker_dt_queue_size: int = 0
+    worker_result_queue_size: int = 0
+    worker_queue_pressure: float = 0.0
+    worker_processing_time_ms: float = 0.0
+    worker_error_count: int = 0
+    worker_recovery_count: int = 0
+    
+    # Physics metrics
+    cloud_count: int = 0
+    active_panels: int = 0
+    total_power_kw: float = 0.0
+    cloud_coverage_pct: float = 0.0
+    wind_speed_ms: float = 0.0
+    
+    last_update_time: float = 0.0
+    
+    def update_frame_timing(self, frame_time_ms: float):
+        """Update frame timing statistics."""
+        self.frames_processed += 1
+        self.total_processing_time += frame_time_ms / 1000.0
         
-        Args:
-            location: Dict with 'latitude', 'longitude', 'altitude', 'timezone'
-        """
-        # Default location (Sri Lanka)
-        if location is None:
-            location = {
-                'latitude': 6.9271,
-                'longitude': 79.8612,
-                'altitude': 10.0,
-                'timezone': 'Asia/Colombo'
-            }
+        if frame_time_ms > self.max_frame_time_ms:
+            self.max_frame_time_ms = frame_time_ms
+        if frame_time_ms < self.min_frame_time_ms:
+            self.min_frame_time_ms = frame_time_ms
             
-        self.location = location
-        self.current_state = None
-        self.forecast = []
-        
-        # Weather patterns
-        self.diurnal_patterns = self._initialize_diurnal_patterns()
-        self.seasonal_patterns = self._initialize_seasonal_patterns()
-        
-        # Atmospheric parameters
-        self.turbidity_model = TurbidityModel(location)
-        self.cloud_model = CloudModel()
-        
-        # Import EnhancedWindField here to avoid circular imports
-        from enhanced_wind_field import HyperOptimizedWindField
-        
-        # Initialize wind field for cloud movement
-        self.wind = HyperOptimizedWindField()
-
-        # Initialize cloud parcels list - limit size for performance
-        self.parcels = []
-        self.max_parcels = getattr(CFG, 'MAX_PARCELS', 12)
-        self.sim_time = 0.0
-        self.time_since_last_spawn = 0.0
-        self.max_gap_sec = 3.0
-        
-        # Caching for expensive computations
-        self._daily_cache = {}
-        self._current_day = None
-        self._diurnal_cache = {}
-        self._season_cache = {}
-        self._current_season = None
-        
-        # Pre-computed arrays for vectorized operations
-        self._hour_array = np.arange(24, dtype=np.float32)
-        self._pi_array = np.pi
-        
-        # Pattern state - simplified tracking
-        self.pattern_intensity = 0.5
-        self.pattern_direction = 0.0
-        self.current_formation_probability = getattr(CFG, 'SPAWN_PROBABILITY', 0.04)
-        self.humidity = 60.0
-        self.temperature = 28.0
-        
-        # Pre-compute precipitation rates for faster lookup
-        self._precip_rates = {
-            'clear': 0, 'cirrus': 0, 'altocumulus': 0,
-            'cumulus': 0.1, 'stratocumulus': 0.5,
-            'nimbostratus': 2.0, 'cumulonimbus': 10.0
-        }
-        
-        # Initialize random generator for reproducibility
-        if seed:
-            np.random.seed(seed)
-            random.seed(seed)
-        
-    def _initialize_diurnal_patterns(self) -> Dict:
-        """Initialize typical daily weather patterns."""
+        self.avg_frame_time_ms = (self.total_processing_time / self.frames_processed) * 1000.0
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization."""
         return {
-            'temperature': {
-                'min_hour': 6,
-                'max_hour': 15,
-                'amplitude': 8  # Daily temperature range
-            },
-            'humidity': {
-                'min_hour': 15,
-                'max_hour': 6,
-                'amplitude': 20
-            },
-            'wind_speed': {
-                'min_hour': 6,
-                'max_hour': 15,
-                'amplitude': 3
-            },
-            'cloud_formation': {
-                'morning_fog': {'start': 5, 'end': 8, 'probability': 0.3},
-                'afternoon_cumulus': {'start': 11, 'end': 17, 'probability': 0.4},
-                'evening_clear': {'start': 18, 'end': 22, 'probability': 0.7}
-            }
+            'frames_processed': self.frames_processed,
+            'avg_frame_time_ms': self.avg_frame_time_ms,
+            'max_frame_time_ms': self.max_frame_time_ms,
+            'min_frame_time_ms': self.min_frame_time_ms,
+            'worker_dt_queue_size': self.worker_dt_queue_size,
+            'worker_result_queue_size': self.worker_result_queue_size,
+            'worker_queue_pressure': self.worker_queue_pressure,
+            'worker_processing_time_ms': self.worker_processing_time_ms,
+            'worker_error_count': self.worker_error_count,
+            'worker_recovery_count': self.worker_recovery_count,
+            'cloud_count': self.cloud_count,
+            'active_panels': self.active_panels,
+            'total_power_kw': self.total_power_kw,
+            'cloud_coverage_pct': self.cloud_coverage_pct,
+            'wind_speed_ms': self.wind_speed_ms
         }
-    
-    def _initialize_seasonal_patterns(self) -> Dict:
-        """Initialize seasonal weather variations."""
-        return {
-            'summer': {
-                'temp_range': (25, 35),
-                'humidity_range': (50, 80),
-                'cloud_types': ['cumulus', 'cumulonimbus'],
-                'turbidity': 4.0
-            },
-            'monsoon': {
-                'temp_range': (22, 30),
-                'humidity_range': (70, 95),
-                'cloud_types': ['nimbostratus', 'cumulonimbus'],
-                'turbidity': 5.0
-            },
-            'winter': {
-                'temp_range': (18, 28),
-                'humidity_range': (40, 70),
-                'cloud_types': ['cirrus', 'altocumulus'],
-                'turbidity': 2.5
-            }
-        }
-    
-    def _get_cached_daily_patterns(self, day_of_year: int) -> Dict:
-        """Get or compute daily patterns for the given day."""
-        if day_of_year in self._daily_cache:
-            return self._daily_cache[day_of_year]
-        
-        # Compute diurnal patterns for this day (vectorized)
-        hours = self._hour_array
-        
-        # Temperature pattern
-        temp_pattern = self.diurnal_patterns['temperature']
-        temp_phase = ((hours - temp_pattern['min_hour']) / 
-                     (temp_pattern['max_hour'] - temp_pattern['min_hour'])) * 2 * self._pi_array
-        temp_factors = 0.5 + 0.5 * np.sin(temp_phase - self._pi_array/2)
-        
-        # Humidity pattern (inverse of temperature)
-        humid_pattern = self.diurnal_patterns['humidity']
-        humid_phase = ((hours - humid_pattern['min_hour']) / 
-                      (humid_pattern['max_hour'] - humid_pattern['min_hour'])) * 2 * self._pi_array
-        humid_factors = 0.5 + 0.5 * np.sin(humid_phase - self._pi_array/2)
-        
-        # Wind pattern
-        wind_pattern = self.diurnal_patterns['wind_speed']
-        wind_phase = ((hours - wind_pattern['min_hour']) / 
-                     (wind_pattern['max_hour'] - wind_pattern['min_hour'])) * 2 * self._pi_array
-        wind_factors = 0.5 + 0.5 * np.sin(wind_phase - self._pi_array/2)
-        
-        patterns = {
-            'temp_factors': temp_factors,
-            'humid_factors': humid_factors,
-            'wind_factors': wind_factors
-        }
-        
-        # Cache the result
-        self._daily_cache[day_of_year] = patterns
-        
-        # Keep only last 2 days in cache to save memory
-        if len(self._daily_cache) > 2:
-            oldest_day = min(self._daily_cache.keys())
-            del self._daily_cache[oldest_day]
-        
-        return patterns
-    
-    def update_weather_pattern(self):
-        """Update global weather pattern with optimized calculations."""
-        # Simplified pattern update - use cached values when possible
-        pattern_cycle = (self.sim_time / 3600) % 24
-        
-        # Use fast trigonometric approximation for real-time updates
-        self.pattern_intensity = 0.5 + 0.5 * math.sin(pattern_cycle * math.pi / 12)
-        
-        # Update wind directions less frequently
-        if int(self.sim_time) % 60 == 0:  # Update every minute
-            pattern_angle = (self.sim_time / 7200) % 360
-            self.pattern_direction = pattern_angle
-        
-        # Update temperature and humidity using simplified model
-        hour = (self.sim_time / 3600) % 24
-        
-        # Use cached diurnal patterns
-        day_of_year = int(self.sim_time / 86400) % 365
-        patterns = self._get_cached_daily_patterns(day_of_year)
-        
-        # Interpolate for current hour
-        hour_idx = int(hour)
-        hour_frac = hour - hour_idx
-        next_hour_idx = (hour_idx + 1) % 24
-        
-        # Linear interpolation between cached values
-        temp_factor = patterns['temp_factors'][hour_idx] * (1 - hour_frac) + \
-                     patterns['temp_factors'][next_hour_idx] * hour_frac
-        humid_factor = patterns['humid_factors'][hour_idx] * (1 - hour_frac) + \
-                      patterns['humid_factors'][next_hour_idx] * hour_frac
-        
-        self.temperature = 28 + 5 * (temp_factor - 0.5) * 2
-        self.humidity = 60 + 20 * (humid_factor - 0.5) * 2
-        
-        # Update cloud formation probability
-        base_prob = getattr(CFG, 'SPAWN_PROBABILITY', 0.04)
-        time_factor = 1.0 + 0.5 * self.pattern_intensity
-        humidity_factor = 1.0 + (self.humidity - 60) / 100
-        
-        self.current_formation_probability = base_prob * time_factor * humidity_factor
-    
-    def _spawn(self, t):
-        """Optimized cloud spawning."""
-        # Import CloudParcel here to avoid circular imports
-        try:
-            from cloud_simulation import UltraOptimizedCloudParcel as EnhancedCloudParcel
-        except ImportError:
-            try:
-                from cloud_simulation import EnhancedCloudParcel
-            except ImportError:
-                print("Warning: EnhancedCloudParcel not available, cloud spawning disabled")
-                return
-        
-        # Fast wind direction lookup
-        try:
-            _, hdg = self.wind.sample(CFG.DOMAIN_SIZE_M/2, CFG.DOMAIN_SIZE_M/2, 1000)
-        except:
-            hdg = 90  # Default East direction
-            
-        d = CFG.DOMAIN_SIZE_M
-        
-        # Vectorized spawn position calculation
-        upwind_angle = (hdg + 180) % 360
-        edge_distance = 0.1 * d
-        center_x, center_y = d / 2, d / 2
-        
-        # Fast edge determination using lookup
-        if 45 <= upwind_angle < 135:  # North edge
-            spawn_x = center_x + random.uniform(-0.4, 0.4) * d
-            spawn_y = -edge_distance
-        elif 135 <= upwind_angle < 225:  # East edge
-            spawn_x = d + edge_distance
-            spawn_y = center_y + random.uniform(-0.4, 0.4) * d
-        elif 225 <= upwind_angle < 315:  # South edge
-            spawn_x = center_x + random.uniform(-0.4, 0.4) * d
-            spawn_y = d + edge_distance
-        else:  # West edge
-            spawn_x = -edge_distance
-            spawn_y = center_y + random.uniform(-0.4, 0.4) * d
-        
-        # Fast cloud type selection using numpy
-        if self.humidity > 80:
-            types = ["cirrus", "cumulus", "cumulonimbus"]
-            weights = [0.1, 0.4, 0.5]
-        elif self.humidity > 60:
-            types = ["cirrus", "cumulus", "cumulonimbus"]
-            weights = [0.3, 0.6, 0.1]
-        else:
-            types = ["cirrus", "cumulus", "cumulonimbus"]
-            weights = [0.7, 0.2, 0.1]
-            
-        ctype = np.random.choice(types, p=weights)
-        
-        # FIXED: Create new cloud parcel with proper constructor
-        try:
-            # Try with cloud type parameter first
-            new_cloud = EnhancedCloudParcel(spawn_x, spawn_y, ctype)
-        except TypeError:
-            try:
-                # Fallback to wind parameter if that's what the class expects
-                new_cloud = EnhancedCloudParcel(spawn_x, spawn_y, self.wind, ctype)
-            except TypeError:
-                # Final fallback to minimal parameters
-                new_cloud = EnhancedCloudParcel(spawn_x, spawn_y, ctype)
-        
-        self.parcels.append(new_cloud)
-        print(f"Spawned {ctype} cloud at ({spawn_x:.1f}, {spawn_y:.1f})")
-    
-    def step(self, t=None, dt=None, t_s=None):
-        """Optimized weather system step with minimal allocations."""
-        # Update simulation time
-        if t_s is not None:
-            self.sim_time = t_s
-        elif t is not None:
-            self.sim_time = t
-        else:
-            self.sim_time += 1
-        
-        # Use physics timestep if dt not provided
-        if dt is None:
-            dt = getattr(CFG, 'PHYSICS_TIMESTEP', 1/60.0)
-        
-        # Update global weather pattern
-        self.update_weather_pattern()
-        
-        # Update wind field
-        if hasattr(self.wind, 'step'):
-            self.wind.step(self.sim_time)
-        
-        # Optimized parcel updates - process in batches
-        if self.parcels:
-            # Process all parcels in vectorized operations where possible
-            expired_indices = []
-            for i, parcel in enumerate(self.parcels):
-                if hasattr(parcel, 'step'):
-                    if parcel.step(dt, self.wind, self.sim_time):
-                        expired_indices.append(i)
-            
-            # Remove expired parcels efficiently
-            if expired_indices:
-                # Remove in reverse order to preserve indices
-                for i in reversed(expired_indices):
-                    self.parcels.pop(i)
-        
-        # Handle cloud scattering with minimal allocations
-        if self.parcels:
-            new_parcels = []
-            for p in self.parcels:
-                if getattr(p, "flag_for_split", False):
-                    # Create fragments efficiently
-                    n = random.randint(2, 3)
-                    
-                    for _ in range(n):
-                        try:
-                            from cloud_simulation import UltraOptimizedCloudParcel as EnhancedCloudParcel
-                        except ImportError:
-                            try:
-                                from cloud_simulation import EnhancedCloudParcel
-                            except ImportError:
-                                break
-                        
-                        try:
-                            # Try different constructor patterns
-                            child = EnhancedCloudParcel(
-                                p.x + random.uniform(-500, 500),
-                                p.y + random.uniform(-500, 500),
-                                p.type)
-                        except TypeError:
-                            try:
-                                child = p.__class__(
-                                    p.x + random.uniform(-500, 500),
-                                    p.y + random.uniform(-500, 500),
-                                    p.wind, p.type)
-                            except:
-                                break
-                        
-                        child.vx, child.vy = p.vx, p.vy
-                        child.r = p.r * random.uniform(0.8, 0.9)
-                        if hasattr(p, 'growth_frames'):
-                            child.age = p.growth_frames
-                        new_parcels.append(child)
-                    
-                    p.flag_for_split = False
-                    p.split_fading = 60
-                    new_parcels.append(p)
-                else:
-                    new_parcels.append(p)
-            
-            self.parcels = new_parcels
-        
-        # Optimized spawning logic
-        self.time_since_last_spawn += dt
-        
-        # Check spawning conditions efficiently
-        should_spawn = False
-        
-        if hasattr(CFG, 'SINGLE_CLOUD_MODE') and CFG.SINGLE_CLOUD_MODE:
-            should_spawn = len(self.parcels) == 0
-        else:
-            max_parcels = self.max_parcels
-            need_forced = (len(self.parcels) == 0 and 
-                          self.time_since_last_spawn > self.max_gap_sec)
-            
-            should_spawn = (len(self.parcels) < max_parcels and 
-                           (random.random() < self.current_formation_probability or 
-                            need_forced))
-        
-        if should_spawn:
-            self._spawn(self.sim_time)
-            self.time_since_last_spawn = 0.0
-    
-    def get_avg_trajectory(self):
-        """Optimized trajectory calculation using vectorized operations."""
-        if not self.parcels:
-            return None, None, 0
-        
-        # Vectorize velocity calculations
-        velocities = np.array([(p.vx, p.vy) for p in self.parcels 
-                              if hasattr(p, 'vx') and hasattr(p, 'vy')])
-        
-        if len(velocities) == 0:
-            return None, None, 0
-        
-        # Vectorized speed and direction calculations
-        speeds = np.linalg.norm(velocities, axis=1)
-        directions = np.arctan2(velocities[:, 1], velocities[:, 0])
-        
-        # Convert to unit vectors and average
-        unit_vectors = np.column_stack([np.cos(directions), np.sin(directions)])
-        mean_vector = np.mean(unit_vectors, axis=0)
-        
-        avg_speed = np.mean(speeds)
-        avg_direction = np.degrees(np.arctan2(mean_vector[1], mean_vector[0])) % 360
-        confidence = np.linalg.norm(mean_vector)
-        
-        # Convert m/s to km/h
-        avg_speed_kmh = avg_speed * 3.6
-        return avg_speed_kmh, avg_direction, confidence
-    
-    def current_cloud_cover_pct(self):
-        """Optimized cloud cover calculation."""
-        if not self.parcels:
-            return 0.0
-        
-        # Vectorized area calculation
-        radii = np.array([p.r for p in self.parcels if hasattr(p, 'r')])
-        if len(radii) == 0:
-            return 0.0
-        
-        total_area = np.sum(np.pi * radii**2)
-        domain_area = getattr(CFG, 'AREA_SIZE_KM', 50)**2
-        
-        cover = min(100, (total_area / domain_area) * 100 * 5)
-        return cover
 
-# Alias for backward compatibility
-WeatherSystem = OptimizedWeatherSystem
+
+@dataclass
+class SimulationConfig:
+    """Configuration for simulation controller with threading support."""
+    use_threading: bool = True
+    worker_queue_sizes: Dict[str, int] = field(default_factory=lambda: {'dt': 5, 'result': 3})
+    target_fps: float = 60.0
+    physics_timestep: float = 1/60.0
+    time_scale: float = 1.0
+    start_time: float = 11.0
+    timestep_minutes: int = 5
+    enable_performance_monitoring: bool = True
+    performance_update_interval: float = 1.0
+    coordinates_file: str = "extended_coordinates.csv"
+    validate_coordinates: bool = True
+    weather_seed: Optional[int] = None
+    latitude: float = 6.9271
+    longitude: float = 79.8612
+    timezone_offset: float = 5.5
+    debug_mode: bool = False
+    verbose_logging: bool = False
+    
+    @classmethod
+    def from_dict(cls, config_dict: Dict[str, Any]) -> 'SimulationConfig':
+        return cls(**config_dict)
+    
+    @classmethod
+    def from_file(cls, config_path: str) -> 'SimulationConfig':
+        try:
+            with open(config_path, 'r') as f:
+                config_dict = json.load(f)
+            return cls.from_dict(config_dict)
+        except Exception as e:
+            logger.warning(f"Could not load config from {config_path}: {e}")
+            return cls()
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'use_threading': self.use_threading,
+            'worker_queue_sizes': self.worker_queue_sizes,
+            'target_fps': self.target_fps,
+            'physics_timestep': self.physics_timestep,
+            'time_scale': self.time_scale,
+            'start_time': self.start_time,
+            'timestep_minutes': self.timestep_minutes,
+            'enable_performance_monitoring': self.enable_performance_monitoring,
+            'performance_update_interval': self.performance_update_interval,
+            'coordinates_file': self.coordinates_file,
+            'validate_coordinates': self.validate_coordinates,
+            'weather_seed': self.weather_seed,
+            'latitude': self.latitude,
+            'longitude': self.longitude,
+            'timezone_offset': self.timezone_offset,
+            'debug_mode': self.debug_mode,
+            'verbose_logging': self.verbose_logging
+        }
+    
+    def save_to_file(self, config_path: str):
+        try:
+            with open(config_path, 'w') as f:
+                json.dump(self.to_dict(), f, indent=2)
+            logger.info(f"Configuration saved to {config_path}")
+        except Exception as e:
+            logger.error(f"Could not save config to {config_path}: {e}")
+
 
 class SimulationController:
     """
-    Main simulation controller that orchestrates the solar farm simulation.
-    Optimized for performance with streamlined operations.
+    Enhanced simulation controller with complete threading support.
+    
+    Threading Architecture:
+    ┌─────────────────┐    dt     ┌─────────────────┐
+    │   Main Thread   │─────────→│  Physics Thread │
+    │ (Rendering & I/O)│          │   (Worker)      │
+    └─────────────────┘←─────────┐                 │
+             │  result           │                 │
+             └───────────────────┘─────────────────┘
     """
     
-    def __init__(self, start_time=11.0, duration_hours=None, timestep_minutes=5, 
-                 real_time_output=False, debug_mode=False, panel_df=None):
+    def __init__(self, config: Optional[Union[SimulationConfig, Dict[str, Any]]] = None,
+                 panel_df: Optional[pd.DataFrame] = None,
+                 **kwargs):
         """
-        Initialize simulation controller.
+        Initialize simulation controller with threading support.
         
         Args:
-            start_time: Starting hour of simulation
-            duration_hours: Duration to run (None for infinite)
-            timestep_minutes: Time step in minutes
-            real_time_output: Enable real-time output
-            debug_mode: Enable debug logging
-            panel_df: Panel DataFrame
+            config: SimulationConfig instance or dict
+            panel_df: Panel DataFrame with coordinates and properties
+            **kwargs: Additional configuration overrides
         """
-        self.start_time = start_time
-        self.duration_hours = duration_hours
-        self.timestep_minutes = timestep_minutes
-        self.real_time_output = real_time_output
-        self.debug_mode = debug_mode
-        self.current_hour = start_time
-        self.panel_df = panel_df if panel_df is not None else panel_df
-        self.CELL_SIZE_KM = 2.0
-        self.panel_cells = build_panel_cells(self.CELL_SIZE_KM)
+        # Initialize configuration
+        if isinstance(config, dict):
+            self.config = SimulationConfig.from_dict(config)
+        elif isinstance(config, SimulationConfig):
+            self.config = config
+        else:
+            self.config = SimulationConfig()
         
-        # Initialize all subsystems
-        self._initialize_systems()
+        # Apply overrides
+        for key, value in kwargs.items():
+            if hasattr(self.config, key):
+                setattr(self.config, key, value)
         
-        # Performance tracking
+        # Validation
+        self._validate_configuration()
+        
+        if self.config.verbose_logging:
+            logging.getLogger().setLevel(logging.DEBUG)
+        
+        logger.info(f"Initializing SimulationController:")
+        logger.info(f"  Threading: {'enabled' if self.config.use_threading else 'disabled'}")
+        logger.info(f"  Start time: {self.config.start_time:.1f}h")
+        logger.info(f"  Debug mode: {self.config.debug_mode}")
+        
+        # State management
+        self.current_hour = self.config.start_time
         self.frame_count = 0
-        self.last_physics_time = time.time()
-        self.accumulated_dt = 0.0
+        self.simulation_start_time = None  # Will be set when simulation starts
+        self.last_update_time = None
         
-        # UI elements (lazy initialization)
-        self.font = None
-        self.large_font = None
-        self.info_panel_bg = None
+        # Load panel data
+        self.panel_df = self._load_panel_data(panel_df)
         
-        # OpenGL rendering support
-        self.use_gl_renderer = False
-        self.gl_cloud_renderer = None
-        self.gl_panel_renderer = None
-        self.gl_ui_renderer = None
-        self.screen_width = 1200
-        self.screen_height = 900
+        # Threading components
+        self.worker = None
+        self._last_state = None
+        self._simulation_lock = threading.RLock()
+        self._shutdown_requested = False
+        self._context_managed = False
+        
+        # Performance monitoring
+        self.performance_metrics = PerformanceMetrics()
+        self.performance_history = deque(maxlen=100)
+        self.last_performance_update = 0.0
+        
+        # Initialize simulation components
+        self._initialize_components()
+        
+        # Initialize physics worker if threading is enabled
+        if self.config.use_threading:
+            self._initialize_physics_worker()
+        
+        logger.info("✓ SimulationController initialization complete")
     
-    def _initialize_systems(self):
-        """Initialize all simulation subsystems efficiently."""
+    def _validate_configuration(self):
+        """Validate configuration parameters."""
+        if self.config.physics_timestep <= 0:
+            raise ValueError("physics_timestep must be positive")
+        if self.config.target_fps <= 0:
+            raise ValueError("target_fps must be positive")
+        if not (0 <= self.config.start_time < 24):
+            logger.warning(f"start_time {self.config.start_time} outside 0-24 range")
+            self.config.start_time = self.config.start_time % 24.0
+    
+    def _load_panel_data(self, panel_df: Optional[pd.DataFrame]) -> pd.DataFrame:
+        """Load or validate panel data."""
+        if panel_df is not None:
+            logger.info(f"Using provided panel data: {len(panel_df)} panels")
+            return panel_df.copy()
+        
+        # Try to load from coordinates file
+        if os.path.exists(self.config.coordinates_file):
+            try:
+                panel_df = pd.read_csv(self.config.coordinates_file)
+                logger.info(f"Loaded panel data from {self.config.coordinates_file}: {len(panel_df)} panels")
+                
+                # Validate required columns
+                required_cols = ['panel_id', 'x_km', 'y_km', 'x', 'y']
+                missing_cols = [col for col in required_cols if col not in panel_df.columns]
+                if missing_cols:
+                    logger.warning(f"Missing columns in panel data: {missing_cols}")
+                
+                # Add default power capacity if missing
+                if 'power_capacity' not in panel_df.columns:
+                    panel_df = panel_df.copy()
+                    panel_df['power_capacity'] = 5.0  # 5kW default
+                    logger.info("Added default power_capacity (5.0 kW) for all panels")
+                
+                return panel_df
+                
+            except Exception as e:
+                logger.error(f"Error loading panel data from {self.config.coordinates_file}: {e}")
+        
+        # Create default panel data
+        logger.info("Creating default panel data")
+        return self._create_default_panel_data()
+    
+    def _create_default_panel_data(self) -> pd.DataFrame:
+        """Create default panel data for testing."""
+        num_panels = 36
+        grid_size = int(np.sqrt(num_panels))
+        
+        panel_data = []
+        for i in range(grid_size):
+            for j in range(grid_size):
+                if i * grid_size + j < num_panels:
+                    panel_data.append({
+                        'panel_id': f"P{i*grid_size+j+1:03d}",
+                        'x_km': 1.0 + i * 1.5,
+                        'y_km': 1.0 + j * 1.5,
+                        'x': 100 + i * 150,
+                        'y': 100 + j * 150,
+                        'power_capacity': 5.0  # 5kW panels
+                    })
+        
+        logger.info(f"Generated {len(panel_data)} default panels")
+        return pd.DataFrame(panel_data)
+    
+    def _initialize_components(self):
+        """Initialize simulation components."""
         try:
-            # Initialize weather system (optimized)
-            self.weather_system = OptimizedWeatherSystem()
-            print("Optimized weather system initialized")
+            # Weather system
+            from cloud_simulation import OptimizedWeatherSystem
+            seed = self.config.weather_seed or hash(str(self.config.start_time)) % 1000000
+            self.weather_system = OptimizedWeatherSystem(seed=seed)
+            logger.info("✓ Weather system initialized")
             
-            # Initialize shadow calculator
+            # Wind field
+            try:
+                from enhanced_wind_field import HyperOptimizedWindField
+                self.wind_field = HyperOptimizedWindField()
+                logger.info("✓ Wind field initialized")
+            except ImportError:
+                logger.warning("Enhanced wind field not available, using fallback")
+                self.wind_field = None
+            
+            # Shadow calculator
             from shadow_calculator import ShadowCalculator
             self.shadow_calculator = ShadowCalculator(
-                domain_size=CFG.DOMAIN_SIZE_M,
-                area_size_km=CFG.AREA_SIZE_KM
+                panel_df=self.panel_df,
+                domain_size=CFG.DOMAIN_SIZE_M
             )
-            self.shadow_calculator.cloud_transmittance = CFG.CLOUD_TRANSMITTANCE
-            self.shadow_calculator.shadow_fade_ms = CFG.SHADOW_FADE_MS
-            self.shadow_calculator.spatial_cell_size = self.CELL_SIZE_KM
+            logger.info("✓ Shadow calculator initialized")
             
-            print(f"Shadow calculator initialized (transmittance={self.shadow_calculator.cloud_transmittance})")
-            print(f"Panel spatial index built with {len(self.panel_cells)} cells")
-            
-            # Initialize power simulator
-            self._initialize_power_simulator()
-            
-        except Exception as e:
-            print(f"Error during system initialization: {e}")
-            import traceback
-            traceback.print_exc()
-            raise
-    
-    def _initialize_power_simulator(self):
-        """Initialize power simulator with error handling."""
-        try:
+            # Power simulator
             from power_simulator import PowerSimulator
             self.power_simulator = PowerSimulator(
                 panel_df=self.panel_df,
-                latitude=6.9271,
-                longitude=79.8612
+                latitude=self.config.latitude,
+                longitude=self.config.longitude,
+                timezone_offset=self.config.timezone_offset
             )
-            print("Power simulator initialized")
+            logger.info("✓ Power simulator initialized")
             
-            # Set default values if missing
-            if not hasattr(self.power_simulator, 'sunrise_hour'):
-                self.power_simulator.sunrise_hour = 6.5
-            if not hasattr(self.power_simulator, 'sunset_hour'):
-                self.power_simulator.sunset_hour = 18.5
-            if not hasattr(self.power_simulator, 'calculate_solar_position'):
-                self.power_simulator.calculate_solar_position = lambda hour: {
-                    "elevation": 90 - abs(12-hour)*7, 
-                    "azimuth": (180 + (hour-12)*15) % 360
-                }
-                
-            print(f"Solar generation hours: {self.power_simulator.sunrise_hour:.1f}h to {self.power_simulator.sunset_hour:.1f}h")
+            # Apply global time scale
+            CFG.TIME_SCALE = self.config.time_scale
+            CFG.PHYSICS_TIMESTEP = self.config.physics_timestep
             
         except Exception as e:
-            print(f"Error initializing power simulator: {e}")
-            import traceback
-            traceback.print_exc()
-            
-            # Create fallback power simulator
-            from types import SimpleNamespace
-            self.power_simulator = SimpleNamespace()
-            self.power_simulator.calculate_power = lambda hour, coverage: {"total": 0.0}
-            self.power_simulator.sunrise_hour = 6.5
-            self.power_simulator.sunset_hour = 18.5
-            self.power_simulator.calculate_solar_position = lambda hour: {"elevation": 90-abs(12-hour)*7, "azimuth": 180}
+            logger.error(f"Error initializing components: {e}")
+            if self.config.debug_mode:
+                traceback.print_exc()
+            raise
     
-    def step(self, dt=None):
+    def _initialize_physics_worker(self):
+        """Initialize physics worker thread."""
+        try:
+            logger.debug("Initializing physics worker...")
+            from worker_thread import PhysicsWorker
+            self.worker = PhysicsWorker(
+                weather_system=self.weather_system,
+                shadow_calculator=self.shadow_calculator,
+                power_simulator=self.power_simulator,
+                panel_df=self.panel_df
+            )
+            self.worker.start()
+            logger.info("✓ Physics worker thread started")
+        except Exception as e:
+            logger.error(f"Error initializing physics worker: {e}")
+            logger.warning("Falling back to non-threaded mode")
+            self.config.use_threading = False
+    
+    @contextmanager
+    def _simulation_context(self):
+        """Context manager for simulation state."""
+        if self._context_managed:
+            yield
+        else:
+            self._context_managed = True
+            try:
+                if self.simulation_start_time is None:
+                    self.simulation_start_time = 0.0  # Start time reference
+                    self.last_update_time = 0.0
+                yield
+            finally:
+                self._context_managed = False
+    
+    def step(self, dt: float = None) -> Dict[str, Any]:
         """
-        FIXED: Execute one simulation step with proper dt handling.
+        Main simulation step - handles both threaded and non-threaded modes.
         
         Args:
-            dt: Delta time in seconds from main loop
+            dt: Delta time in seconds (defaults to physics timestep)
             
         Returns:
-            Dictionary with simulation results
+            Dictionary containing simulation state
         """
-        self.frame_count += 1
-        
-        # FIXED: Use passed dt parameter directly instead of computing our own
         if dt is None:
-            dt = CFG.PHYSICS_TIMESTEP
+            dt = self.config.physics_timestep
         
-        # Update simulation time using passed dt
-        self.current_hour += dt * (self.timestep_minutes / 60.0) / (5.0 / 60.0)
-        self.current_hour = self.current_hour % 24
-        
-        # FIXED: Step weather system with proper dt
-        self.weather_system.step(dt=dt)
-        
-        # Create timestamp for current simulation time
-        current_time_obj = datetime.now()
-        hour = int(self.current_hour)
-        minute = int((self.current_hour % 1) * 60)
-        timestamp = current_time_obj.replace(hour=hour, minute=minute)
-        
-        # Get solar position
-        solar_position = self.power_simulator.calculate_solar_position(self.current_hour)
-        
-        # FIXED: Get cloud ellipses from weather system with enhanced debug logging
-        from cloud_simulation import collect_visible_ellipses
-        cloud_ellipses = collect_visible_ellipses(self.weather_system.parcels)
-        
-        # ADDED: Enhanced render-path debug logging
-        if self.debug_mode and self.frame_count % 30 == 0:  # Every 30 frames
-            print(f"[RENDER DEBUG] Frame {self.frame_count}: drawing {len(cloud_ellipses)} ellipses")
-            if len(cloud_ellipses) >= 3:
-                first_three = cloud_ellipses[:3]
-                print(f"[RENDER DEBUG] First three ellipses: {first_three}")
-            elif cloud_ellipses:
-                print(f"[RENDER DEBUG] Available ellipses: {cloud_ellipses}")
-            else:
-                print(f"[RENDER DEBUG] No ellipses to render")
+        with self._simulation_context():
+            frame_start_time = self._get_current_time()
             
-            print(f"[RENDER DEBUG] Active parcels: {len(self.weather_system.parcels)}")
-            if self.weather_system.parcels:
-                for i, parcel in enumerate(self.weather_system.parcels[:3]):
-                    if hasattr(parcel, 'x') and hasattr(parcel, 'vx'):
-                        print(f"[RENDER DEBUG] Parcel {i}: pos=({parcel.x:.1f}, {parcel.y:.1f}), vel=({parcel.vx:.3f}, {parcel.vy:.3f})")
-        
-        # Calculate shadow coverage
-        ellipses_for_shadow = [e[:7] for e in cloud_ellipses]
-        panel_coverage = self.shadow_calculator.calculate_panel_coverage(
-            ellipses_for_shadow, self.panel_df, solar_position, self.panel_cells
-        )
-        
-        # Calculate power output
-        power_output = self.power_simulator.calculate_power(
-            self.current_hour, panel_coverage
-        )
-        
-        # Get trajectory information
-        cloud_speed, cloud_direction, confidence = self.weather_system.get_avg_trajectory()
-        
-        # Debug output (throttled)
-        if self.debug_mode and self.frame_count % 60 == 0:
-            print(f"Hour: {self.current_hour:.2f}, Cloud count: {len(cloud_ellipses)}")
-            print(f"Solar position: El={solar_position['elevation']:.1f}°, Az={solar_position['azimuth']:.1f}°")
-            print(f"Cloud cover: {self.weather_system.current_cloud_cover_pct():.1f}%, Total power: {power_output.get('total', 0.0):.2f} kW")
-            if cloud_speed is not None:
-                print(f"Cloud movement: {cloud_speed:.1f} km/h, {cloud_direction:.0f}°")
-        
-        # Calculate interpolation alpha for smooth rendering
-        alpha = 0.5  # FIXED: Use a consistent alpha for smooth rendering
-        
-        return {
-            'time': timestamp,
-            'cloud_ellipses': cloud_ellipses,
-            'panel_coverage': panel_coverage,
-            'power_output': power_output,
-            'total_power': power_output.get('total', 0.0),
-            'cloud_cover': self.weather_system.current_cloud_cover_pct(),
-            'cloud_speed': cloud_speed,
-            'cloud_direction': cloud_direction,
-            'confidence': confidence,
-            'solar_position': solar_position,
-            'alpha': alpha
-        }
-    
-    def toggle_gl_renderer(self):
-        """Toggle between Pygame and OpenGL renderers"""
-        if not OPENGL_AVAILABLE:
-            print("OpenGL renderers not available. Cannot toggle.")
-            return
-            
-        self.use_gl_renderer = not self.use_gl_renderer
-        
-        # Reset GL renderers if switching back to Pygame
-        if not self.use_gl_renderer:
-            self.gl_cloud_renderer = None
-            self.gl_panel_renderer = None
-            self.gl_ui_renderer = None
-            
-            # Recreate the Pygame window
-            import pygame
-            pygame.display.set_mode((self.screen_width, self.screen_height), pygame.RESIZABLE)
-        
-        print(f"Using {'OpenGL' if self.use_gl_renderer else 'Pygame'} renderer")
-    
-    def render_clouds(self, screen, cloud_ellipses, cloud_positions, x_range, y_range, width, height, alpha=0.0):
-        """Render clouds using either Pygame or OpenGL with improved interpolation"""
-        # Ensure alpha is properly clamped to improve smoothness
-        alpha = max(0.01, min(0.99, alpha))  # Never use exactly 0 or 1 to ensure smoothness
-        
-        # Apply cubic easing for super-smooth motion
-        eased_alpha = alpha * alpha * (3 - 2 * alpha)  # Cubic easing function
-        
-        if self.use_gl_renderer and OPENGL_AVAILABLE:
-            # Initialize GL renderer if not already done
-            if self.gl_cloud_renderer is None:
-                self.gl_cloud_renderer = initialize_gl_for_pygame(screen)
-                if self.gl_cloud_renderer is None:
-                    # Fallback to Pygame if OpenGL initialization fails
-                    self.use_gl_renderer = False
-                    print("OpenGL initialization failed. Falling back to Pygame renderer.")
+            try:
+                if self.config.use_threading and self.worker:
+                    result = self._step_threaded(dt)
                 else:
-                    self.screen_width, self.screen_height = screen.get_size()
-            
-            # Render clouds with OpenGL if renderer is available
-            if self.gl_cloud_renderer:
-                # Create interpolated ellipses for smooth rendering
-                interpolated_ellipses = []
-                for i, ellipse_params in enumerate(cloud_ellipses):
-                    if len(ellipse_params) >= 8:  # Has position data
-                        # Get current position
-                        cx, cy = ellipse_params[0], ellipse_params[1]
-                        
-                        # Find corresponding parcel for previous position
-                        if i < len(self.weather_system.parcels):
-                            parcel = self.weather_system.parcels[i]
-                            if hasattr(parcel, 'prev_x') and hasattr(parcel, 'prev_y'):
-                                # Interpolate position with eased alpha
-                                interp_x = parcel.prev_x * (1 - eased_alpha) + cx * eased_alpha
-                                interp_y = parcel.prev_y * (1 - eased_alpha) + cy * eased_alpha
-                                
-                                # Create interpolated ellipse
-                                interp_ellipse = (interp_x, interp_y) + ellipse_params[2:]
-                                interpolated_ellipses.append(interp_ellipse)
-                            else:
-                                interpolated_ellipses.append(ellipse_params)
-                        else:
-                            interpolated_ellipses.append(ellipse_params)
-                    else:
-                        interpolated_ellipses.append(ellipse_params)
+                    result = self._step_direct(dt)
                 
-                render_gl_clouds(screen, self.gl_cloud_renderer, interpolated_ellipses, x_range, y_range)
-                return
+                # Update performance metrics
+                frame_time_ms = (self._get_current_time() - frame_start_time) * 1000.0
+                self._update_performance_metrics(frame_time_ms, result)
+                
+                # Update frame count and timing
+                self.frame_count += 1
+                if self.last_update_time is not None:
+                    self.current_hour += dt * self.config.time_scale / 3600.0
+                    self.current_hour = self.current_hour % 24.0
+                self.last_update_time = frame_start_time
+                
+                return result
+                
+            except Exception as e:
+                logger.error(f"Error in simulation step: {e}")
+                if self.config.debug_mode:
+                    traceback.print_exc()
+                
+                # Return fallback state
+                return self._create_fallback_state()
+    
+    def _get_current_time(self) -> float:
+        """Get current time for performance measurement."""
+        return self.frame_count * self.config.physics_timestep  # Simulation time
+    
+    def _step_threaded(self, dt: float) -> Dict[str, Any]:
+        """Handle threaded simulation step."""
+        # Submit timestep to worker
+        if self.worker:
+            success = self.worker.submit_timestep(dt)
+            if not success and self.config.debug_mode:
+                logger.debug("Worker queue full, dropping timestep")
         
-        # FIXED: Use the corrected Pygame renderer import path
-        from cloud_renderer import draw_cloud_trail, create_cloud_surface
+        # Get latest results from worker
+        latest_state = None
+        if self.worker:
+            latest_state = self.worker.get_latest_results()
         
-        # Draw cloud trail with interpolation
-        interpolated_positions = []
-        for pos in cloud_positions:
-            interpolated_positions.append(pos)  # Trail positions don't need interpolation
+        if latest_state:
+            # Convert worker state to simulation result
+            result = latest_state.to_dict()
+            self._last_state = result
+            return result
+        else:
+            # No new results, use cached state
+            if self._last_state:
+                return self._last_state
+            else:
+                return self._create_fallback_state()
+    
+    def _step_direct(self, dt: float) -> Dict[str, Any]:
+        """
+        Handle direct (non-threaded) simulation step.
         
-        draw_cloud_trail(screen, interpolated_positions, x_range, y_range, width, height)
+        This method contains the CRITICAL FIX for the t_s parameter issue.
+        """
+        # Update simulation time
+        sim_time = self.frame_count * dt
         
-        # Render each cloud with position interpolation and smooth easing
-        for i, ellipse_params in enumerate(cloud_ellipses):
-            # Get interpolated ellipse parameters
-            if i < len(self.weather_system.parcels):
-                parcel = self.weather_system.parcels[i]
-                if hasattr(parcel, 'prev_x') and hasattr(parcel, 'prev_y'):
-                    # Interpolate cloud position with eased alpha for smoother motion
-                    cx, cy = ellipse_params[0], ellipse_params[1]
-                    interp_x = parcel.prev_x * (1 - eased_alpha) + cx * eased_alpha
-                    interp_y = parcel.prev_y * (1 - eased_alpha) + cy * eased_alpha
+        # CRITICAL FIX: Update weather system - removed t_s parameter
+        if self.weather_system:
+            try:
+                if hasattr(self.weather_system, 'step'):
+                    # FIXED: Only pass dt, not t_s
+                    self.weather_system.step(dt=dt)
+                elif hasattr(self.weather_system, 'update'):
+                    self.weather_system.update(dt, current_hour=self.current_hour)
+            except Exception as e:
+                logger.warning(f"Error updating weather system: {e}")
+        
+        # Get cloud data
+        cloud_ellipses = []
+        cloud_positions = []
+        cloud_coverage = 0.0
+        wind_speed = 0.0
+        wind_direction = 0.0
+        
+        if self.weather_system:
+            try:
+                # Get cloud ellipses
+                if hasattr(self.weather_system, 'parcels'):
+                    try:
+                        from cloud_simulation import collect_visible_ellipses
+                        cloud_ellipses = collect_visible_ellipses(self.weather_system.parcels)
+                    except ImportError:
+                        # Fallback: create basic ellipses from parcels
+                        cloud_ellipses = []
+                        for parcel in self.weather_system.parcels:
+                            if hasattr(parcel, 'x') and hasattr(parcel, 'y'):
+                                ellipse = (
+                                    getattr(parcel, 'x', 0),
+                                    getattr(parcel, 'y', 0),
+                                    getattr(parcel, 'size', 100),
+                                    getattr(parcel, 'size', 100),
+                                    0,  # angle
+                                    getattr(parcel, 'density', 0.5),
+                                    getattr(parcel, 'type', 'cumulus')
+                                )
+                                cloud_ellipses.append(ellipse)
                     
-                    # Create interpolated ellipse parameters
-                    interp_ellipse = (interp_x, interp_y) + ellipse_params[2:]
-                else:
-                    interp_ellipse = ellipse_params
-            else:
-                interp_ellipse = ellipse_params
-            
-            # Create and draw cloud surface
-            cloud_surface, pos = create_cloud_surface(
-                interp_ellipse,
-                CFG.DOMAIN_SIZE_M, CFG.AREA_SIZE_KM,
-                width, height,
-                x_range, y_range
-            )
-            screen.blit(cloud_surface, pos)
-    
-    def _draw_cloud_vectors(self, screen, cloud_ellipses, x_range, y_range, width, height):
-        """Draw velocity vectors to visualize cloud gliding direction"""
-        if not hasattr(self.weather_system, 'parcels') or len(self.weather_system.parcels) == 0:
-            return
-            
-        import pygame
-        import math
+                    # Extract positions
+                    cloud_positions = []
+                    for ellipse in cloud_ellipses:
+                        if len(ellipse) >= 2:
+                            x_m, y_m = ellipse[0], ellipse[1]
+                            # Convert to km
+                            domain_size = getattr(CFG, 'DOMAIN_SIZE_M', 10000)
+                            area_size = getattr(CFG, 'AREA_SIZE_KM', 10)
+                            x_km = x_m / domain_size * area_size
+                            y_km = y_m / domain_size * area_size
+                            cloud_positions.append((x_km, y_km))
+                
+                # Get weather metrics
+                if hasattr(self.weather_system, 'current_cloud_cover_pct'):
+                    cloud_coverage = self.weather_system.current_cloud_cover_pct()
+                elif hasattr(self.weather_system, 'get_cloud_coverage'):
+                    cloud_coverage = self.weather_system.get_cloud_coverage()
+                
+                if hasattr(self.weather_system, 'get_avg_trajectory'):
+                    trajectory = self.weather_system.get_avg_trajectory()
+                    if trajectory and len(trajectory) >= 2:
+                        wind_speed, wind_direction = trajectory[0], trajectory[1]
+                        
+            except Exception as e:
+                logger.warning(f"Error getting weather data: {e}")
         
-        for i, parcel in enumerate(self.weather_system.parcels):
-            if hasattr(parcel, 'x') and hasattr(parcel, 'vx'):
-                # Convert position to screen coordinates
-                x_km = parcel.x / CFG.DOMAIN_SIZE_M * CFG.AREA_SIZE_KM
-                y_km = parcel.y / CFG.DOMAIN_SIZE_M * CFG.AREA_SIZE_KM
-                
-                x_px, y_px = km_to_screen_coords(x_km, y_km, x_range, y_range, width, height)
-                
-                # Calculate direction and speed
-                speed = math.sqrt(parcel.vx**2 + parcel.vy**2)
-                direction = math.degrees(math.atan2(parcel.vy, parcel.vx))
-                
-                # Draw direction arrow (scaled by speed)
-                arrow_length = min(50, speed * 50)
-                end_x = x_px + arrow_length * math.cos(math.radians(direction))
-                end_y = y_px + arrow_length * math.sin(math.radians(direction))
-                
-                # Draw arrow
-                pygame.draw.line(screen, (255, 0, 0), (x_px, y_px), (end_x, end_y), width=2)
-                
-                # Draw speed text
-                speed_text = f"{direction:.0f}°, {speed*100:.1f}"
-                if self.font:
-                    speed_surface = self.font.render(speed_text, True, (255, 0, 0))
-                    screen.blit(speed_surface, (x_px + 10, y_px - 20))
-    
-    def render_ui(self, screen, result, width, height, x_range, y_range):
-        """Render UI elements efficiently"""
-        import pygame
+        # Calculate solar position
+        solar_elevation = 45.0  # Default fallback
+        solar_azimuth = 180.0   # Default fallback
         
-        if self.font is None:
-            self.font = pygame.font.SysFont('Arial', 16)
-            self.large_font = pygame.font.SysFont('Arial', 20, bold=True)
-            self.info_panel_bg = pygame.Surface((250, 150), pygame.SRCALPHA)
-            self.info_panel_bg.fill((255, 255, 255, 180))
+        if self.power_simulator and hasattr(self.power_simulator, 'calculate_solar_position'):
+            try:
+                solar_pos = self.power_simulator.calculate_solar_position(self.current_hour)
+                solar_elevation = solar_pos.get('elevation', 45.0)
+                solar_azimuth = solar_pos.get('azimuth', 180.0)
+            except Exception as e:
+                logger.warning(f"Error calculating solar position: {e}")
+        
+        # Calculate shadows
+        panel_coverage = {}
+        if self.shadow_calculator and cloud_ellipses and self.panel_df is not None:
+            try:
+                if hasattr(self.shadow_calculator, 'calculate_shadows'):
+                    self.shadow_calculator.calculate_shadows()
+                
+                if hasattr(self.shadow_calculator, 'calculate_panel_coverage'):
+                    # Convert ellipses for shadow calculation
+                    ellipses_for_shadow = [e[:7] for e in cloud_ellipses if len(e) >= 7]
+                    solar_position = {'elevation': solar_elevation, 'azimuth': solar_azimuth}
+                    panel_coverage = self.shadow_calculator.calculate_panel_coverage(
+                        ellipses_for_shadow, self.panel_df, solar_position
+                    )
+                elif hasattr(self.shadow_calculator, 'get_coverage'):
+                    panel_coverage = self.shadow_calculator.get_coverage()
+                        
+            except Exception as e:
+                logger.warning(f"Error calculating shadows: {e}")
+        
+        # Calculate power
+        power_output = {}
+        total_power = 0.0
+        performance_ratio = 0.0
+        
+        if self.power_simulator:
+            try:
+                if hasattr(self.power_simulator, 'calculate_power'):
+                    power_output = self.power_simulator.calculate_power(
+                        panel_df=self.panel_df,
+                        coverage=panel_coverage,
+                        sim_time=self.current_hour
+                    )
+                elif hasattr(self.power_simulator, 'step'):
+                    power_output = self.power_simulator.step(
+                        self.current_hour, panel_coverage
+                    )
+                
+                # Extract totals
+                if isinstance(power_output, dict):
+                    total_power = power_output.get('total', power_output.get('total_power', 0.0))
+                    performance_ratio = power_output.get('performance_ratio', 0.0)
+                    
+            except Exception as e:
+                logger.warning(f"Error calculating power: {e}")
+        
+        # Package results
+        result = {
+            # Cloud and weather data
+            'cloud_ellipses': cloud_ellipses,
+            'cloud_positions': cloud_positions,
+            'cloud_coverage': cloud_coverage,
+            'wind_speed': wind_speed,
+            'wind_direction': wind_direction,
             
-        cloud_ellipses = result.get('cloud_ellipses', [])
-        panel_coverage = result.get('panel_coverage', {})
-        power_output = result.get('power_output', {})
-        total_power = power_output.get('total', 0.0)
-        total_ac_power = power_output.get('total_ac', 0.0)
-        baseline_total = power_output.get('baseline_total', 0.0)
-        farm_reduction_pct = power_output.get('farm_reduction_pct', 0.0)
-        cloud_cover = result.get('cloud_cover', 0.0)
-        timestamp = result.get('time', datetime.now())
-        cloud_speed = result.get('cloud_speed', None)
-        cloud_direction = result.get('cloud_direction', None)
-        confidence = result.get('confidence', 0)
-        trajectory_source = result.get('trajectory_source', 'physics')
-        solar_position = result.get('solar_position', {'elevation': 90, 'azimuth': 180})
-        
-        time_str = timestamp.strftime("%H:%M") if hasattr(timestamp, 'strftime') else f"{self.current_hour:.1f}h"
-        info_dict = {
-            "Time": time_str,
-            "Sun": f"El={solar_position['elevation']:.1f}°, Az={solar_position['azimuth']:.1f}°",
-            "Cloud Cover": f"{cloud_cover:.1f}%",
-            "DC Power": f"{total_power:.1f} kW",
-            "AC Output": f"{total_ac_power:.1f} kW" if total_ac_power else f"N/A",
-            "Farm Reduction": f"{farm_reduction_pct:.1f}%"
+            # Shadow data
+            'panel_coverage': panel_coverage,
+            
+            # Power data
+            'power_output': power_output,
+            'total_power': total_power,
+            'performance_ratio': performance_ratio,
+            
+            # Environmental data
+            'solar_elevation': solar_elevation,
+            'solar_azimuth': solar_azimuth,
+            'current_hour': self.current_hour,
+            'ambient_temperature': 25.0,  # TODO: Add temperature simulation
+            
+            # Simulation metadata
+            'frame_id': self.frame_count,
+            'physics_dt': dt,
+            'sim_time': sim_time
         }
         
-        if self.use_gl_renderer and OPENGL_AVAILABLE:
-            # Initialize GL renderers if not already done
-            if self.gl_ui_renderer is None:
-                self.gl_ui_renderer = initialize_gl_ui_renderer(screen.get_size())
-            
-            # Draw solar panels with OpenGL
-            if self.gl_panel_renderer is None:
-                self.gl_panel_renderer = initialize_gl_panel_renderer(screen.get_size())
-            
-            # Draw panels using OpenGL if the renderer is available
-            if self.gl_panel_renderer:
-                affected_panels = gl_draw_solar_panels(
-                    screen, self.gl_panel_renderer, self.panel_df, 
-                    panel_coverage, power_output, 
-                    x_range, y_range, width, height
-                )
-            else:
-                # Fallback to Pygame for panels
-                from panel_renderer import draw_solar_panels
-                affected_panels = draw_solar_panels(
-                    screen, self.panel_df, 
-                    panel_coverage, power_output, 
-                    x_range, y_range, width, height
-                )
-            
-            # For now, just create panel background with OpenGL and use Pygame for text
-            if self.gl_ui_renderer:
-                gl_create_info_panel(self.gl_ui_renderer, info_dict, "Simulation Info", (20, 20), 250)
-            
-            # Use Pygame for text rendering
-            self._draw_info_panel(screen, info_dict, "Simulation Info", (20, 20))
-            
-            if farm_reduction_pct > 30:
-                self._draw_warning_bar(screen, farm_reduction_pct, (20, 170), 200, 30)
-            
-            self._draw_trajectory_info(screen, cloud_speed, cloud_direction, confidence, 
-                                     trajectory_source, (20, 210))
-            
-            affected_panels = [p for p, c in panel_coverage.items() if c > 0]
-            self._draw_affected_panels_list(screen, affected_panels, len(self.panel_df), 
-                                           power_output, (width - 350, 20))
-            
-            self._draw_time_slider(screen, self.current_hour, self.power_simulator.sunrise_hour,
-                                  self.power_simulator.sunset_hour, (width//2 - 200, height - 40), 400)
-        else:
-            # FIXED: Use standard Pygame rendering with corrected import
-            from panel_renderer import draw_solar_panels
-            
-            affected_panels = draw_solar_panels(
-                screen, self.panel_df, 
-                panel_coverage, power_output, 
-                x_range, y_range, width, height
-            )
-            
-            self._draw_info_panel(screen, info_dict, "Simulation Info", (20, 20))
-            
-            if farm_reduction_pct > 30:
-                self._draw_warning_bar(screen, farm_reduction_pct, (20, 170), 200, 30)
-            
-            self._draw_trajectory_info(screen, cloud_speed, cloud_direction, confidence, 
-                                     trajectory_source, (20, 210))
-            
-            affected_panels = [p for p, c in panel_coverage.items() if c > 0]
-            self._draw_affected_panels_list(screen, affected_panels, len(self.panel_df), 
-                                           power_output, (width - 350, 20))
-            
-            self._draw_time_slider(screen, self.current_hour, self.power_simulator.sunrise_hour,
-                                  self.power_simulator.sunset_hour, (width//2 - 200, height - 40), 400)
-        
-        # Draw help text regardless of renderer
-        renderer_text = "OpenGL" if self.use_gl_renderer else "Pygame" 
-        help_text = f"Controls: ESC-Quit, ↑↓-Wind Speed, ←→-Movement Speed, G-Toggle Renderer ({renderer_text})"
-        help_surface = self.font.render(help_text, True, (0, 0, 0), (255, 255, 255, 180))
-        screen.blit(help_surface, (width//2 - help_surface.get_width()//2, height - 70))
-        
-        # Add cloud vector visualization in debug mode
-        if self.debug_mode:
-            self._draw_cloud_vectors(screen, cloud_ellipses, x_range, y_range, width, height)
+        self._last_state = result
+        return result
     
-    def _draw_info_panel(self, screen, info_dict, title, position):
-        """Draw information panel with background"""
-        import pygame
-        
-        padding = 10
-        line_height = 24
-        num_lines = len(info_dict) + (1 if title else 0)
-        panel_height = padding * 2 + line_height * num_lines
-        panel_width = 250
-        panel_rect = pygame.Rect(position[0], position[1], panel_width, panel_height)
-        bg_surface = pygame.Surface((panel_width, panel_height), pygame.SRCALPHA)
-        bg_surface.fill((255, 255, 255, 180))
-        screen.blit(bg_surface, position)
-        pygame.draw.rect(screen, (0, 0, 0), panel_rect, width=1)
-        y_offset = position[1] + padding
-        if title:
-            title_surface = self.large_font.render(title, True, (0, 0, 0))
-            screen.blit(title_surface, (position[0] + padding, y_offset))
-            y_offset += line_height
-        for key, value in info_dict.items():
-            text = f"{key}: {value}"
-            text_surface = self.font.render(text, True, (0, 0, 0))
-            screen.blit(text_surface, (position[0] + padding, y_offset))
-            y_offset += line_height
+    def _create_fallback_state(self) -> Dict[str, Any]:
+        """Create fallback state when simulation fails."""
+        return {
+            'cloud_ellipses': [],
+            'cloud_positions': [],
+            'cloud_coverage': 0.0,
+            'wind_speed': 0.0,
+            'wind_direction': 0.0,
+            'panel_coverage': {},
+            'power_output': {},
+            'total_power': 0.0,
+            'performance_ratio': 0.0,
+            'solar_elevation': 45.0,
+            'solar_azimuth': 180.0,
+            'current_hour': self.current_hour,
+            'ambient_temperature': 25.0,
+            'frame_id': self.frame_count,
+            'physics_dt': self.config.physics_timestep,
+            'sim_time': self.frame_count * self.config.physics_timestep
+        }
     
-    def _draw_warning_bar(self, screen, reduction_pct, position, width, height):
-        """Draw power reduction warning bar"""
-        import pygame
+    def _update_performance_metrics(self, frame_time_ms: float, result: Dict[str, Any]):
+        """Update performance monitoring metrics."""
+        self.performance_metrics.update_frame_timing(frame_time_ms)
         
-        bar_rect = pygame.Rect(position[0], position[1], width, height)
-        pygame.draw.rect(screen, (220, 220, 220), bar_rect)
-        pygame.draw.rect(screen, (0, 0, 0), bar_rect, width=1)
-        fill_width = int(min(100, reduction_pct) / 100 * width)
-        if fill_width > 0:
-            fill_rect = pygame.Rect(position[0], position[1], fill_width, height)
-            if reduction_pct < 50:
-                color = (255, 120, 0)
-            else:
-                color = (255, 0, 0)
-            pygame.draw.rect(screen, color, fill_rect)
-        text = f"Power Reduction Warning: {reduction_pct:.1f}%"
-        text_surface = self.font.render(text, True, (0, 0, 0))
-        text_rect = text_surface.get_rect(center=(position[0] + width//2, position[1] + height//2))
-        screen.blit(text_surface, text_rect)
+        # Update simulation metrics
+        self.performance_metrics.cloud_count = len(result.get('cloud_ellipses', []))
+        self.performance_metrics.active_panels = len(self.panel_df) if self.panel_df is not None else 0
+        self.performance_metrics.total_power_kw = result.get('total_power', 0.0)
+        self.performance_metrics.cloud_coverage_pct = result.get('cloud_coverage', 0.0)
+        self.performance_metrics.wind_speed_ms = result.get('wind_speed', 0.0)
+        
+        # Update worker metrics if available
+        if self.worker:
+            try:
+                worker_stats = self.worker.get_performance_stats()
+                self.performance_metrics.worker_dt_queue_size = worker_stats.get('dt_queue_size', 0)
+                self.performance_metrics.worker_result_queue_size = worker_stats.get('result_queue_size', 0)
+                self.performance_metrics.worker_queue_pressure = worker_stats.get('dt_queue_pressure', 0.0)
+                self.performance_metrics.worker_processing_time_ms = worker_stats.get('avg_processing_ms', 0.0)
+                self.performance_metrics.worker_error_count = worker_stats.get('error_count', 0)
+                self.performance_metrics.worker_recovery_count = worker_stats.get('recovery_count', 0)
+            except Exception as e:
+                if self.config.debug_mode:
+                    logger.debug(f"Error getting worker stats: {e}")
+        
+        # Store performance history
+        current_time = self._get_current_time()
+        if (current_time - self.last_performance_update) >= self.config.performance_update_interval:
+            self.performance_history.append({
+                'time': current_time,
+                'metrics': self.performance_metrics.to_dict()
+            })
+            self.last_performance_update = current_time
     
-    def _draw_trajectory_info(self, screen, cloud_speed, cloud_direction, confidence, source, position):
-        """Draw cloud trajectory information with compass"""
-        import pygame
-        import math
-        
-        if cloud_speed is None or cloud_direction is None:
-            text = "Cloud Movement: Not enough data"
-            text_surface = self.font.render(text, True, (0, 0, 0))
-            screen.blit(text_surface, position)
-            return
-        
-        panel_width = 200
-        panel_height = 170
-        panel_rect = pygame.Rect(position[0], position[1], panel_width, panel_height)
-        bg_surface = pygame.Surface((panel_width, panel_height), pygame.SRCALPHA)
-        bg_surface.fill((255, 255, 255, 180))
-        screen.blit(bg_surface, position)
-        pygame.draw.rect(screen, (0, 0, 0), panel_rect, width=1)
-        
-        # Title and text info
-        title_surface = self.large_font.render("Cloud Movement", True, (0, 0, 0))
-        screen.blit(title_surface, (position[0] + 10, position[1] + 10))
-        
-        speed_text = f"Speed: {cloud_speed:.1f} km/h"
-        speed_surface = self.font.render(speed_text, True, (0, 0, 0))
-        screen.blit(speed_surface, (position[0] + 10, position[1] + 40))
-        
-        dir_text = f"Direction: {cloud_direction:.0f}°"
-        dir_surface = self.font.render(dir_text, True, (0, 0, 0))
-        screen.blit(dir_surface, (position[0] + 10, position[1] + 65))
-        
-        conf_text = f"Confidence: {int(confidence * 100)}%"
-        conf_surface = self.font.render(conf_text, True, (0, 0, 0))
-        screen.blit(conf_surface, (position[0] + 10, position[1] + 90))
-        
-        source_text = f"Source: {source.capitalize()}"
-        source_color = (0, 120, 0) if source == 'power' else (0, 0, 120)
-        source_surface = self.font.render(source_text, True, source_color)
-        screen.blit(source_surface, (position[0] + 10, position[1] + 115))
-        
-        # Draw compass and arrow
-        arrow_center = (position[0] + panel_width // 2, position[1] + panel_height - 30)
-        arrow_length = 30
-        direction_rad = math.radians(cloud_direction)
-        end_x = arrow_center[0] + arrow_length * math.cos(direction_rad)
-        end_y = arrow_center[1] - arrow_length * math.sin(direction_rad)
-        
-        # Compass circle
-        pygame.draw.circle(screen, (230, 230, 230), arrow_center, arrow_length + 5)
-        pygame.draw.circle(screen, (0, 0, 0), arrow_center, arrow_length + 5, width=1)
-        
-        # Arrow color based on source
-        if source == 'power':
-            arrow_color = (0, 150, 0)
-        else:
-            if confidence > 0.7:
-                arrow_color = (0, 0, 150)
-            elif confidence > 0.3:
-                arrow_color = (150, 150, 0)
-            else:
-                arrow_color = (150, 0, 0)
-        
-        # Draw arrow
-        pygame.draw.line(screen, arrow_color, arrow_center, (end_x, end_y), width=3)
+    def get_performance_stats(self) -> Dict[str, Any]:
+        """Get current performance statistics."""
+        stats = self.performance_metrics.to_dict()
+        stats.update({
+            'simulation_time_hours': self.current_hour,
+            'frame_count': self.frame_count,
+            'threading_enabled': self.config.use_threading,
+            'worker_active': self.worker is not None and self.worker.is_alive() if self.worker else False
+        })
+        return stats
     
-    def _draw_affected_panels_list(self, screen, affected_panels, total_panels, power_output, position):
-        """Draw list of affected panels"""
-        import pygame
+    def get_debug_info(self) -> Dict[str, Any]:
+        """Get detailed debug information."""
+        debug_info = {
+            'config': self.config.to_dict(),
+            'performance': self.get_performance_stats(),
+            'simulation_state': {
+                'current_hour': self.current_hour,
+                'frame_count': self.frame_count,
+                'simulation_start_time': self.simulation_start_time,
+                'last_update_time': self.last_update_time
+            },
+            'components': {
+                'weather_system': type(self.weather_system).__name__ if self.weather_system else None,
+                'shadow_calculator': type(self.shadow_calculator).__name__ if self.shadow_calculator else None,
+                'power_simulator': type(self.power_simulator).__name__ if self.power_simulator else None,
+                'panel_count': len(self.panel_df) if self.panel_df is not None else 0
+            }
+        }
         
-        if not affected_panels:
-            return
+        # Add worker debug info
+        if self.worker:
+            try:
+                debug_info['worker'] = self.worker.get_debug_info()
+            except Exception as e:
+                debug_info['worker'] = {'error': str(e)}
         
-        panel_width = 300
-        panel_height = 250
-        padding = 10
-        line_height = 20
-        panel_rect = pygame.Rect(position[0], position[1], panel_width, panel_height)
-        bg_surface = pygame.Surface((panel_width, panel_height), pygame.SRCALPHA)
-        bg_surface.fill((255, 255, 255, 180))
-        screen.blit(bg_surface, position)
-        pygame.draw.rect(screen, (0, 0, 0), panel_rect, width=1)
-        
-        affected_count = len(affected_panels)
-        affected_pct = affected_count / total_panels * 100 if total_panels > 0 else 0
-        title = f"Affected Panels: {affected_count}/{total_panels} ({affected_pct:.1f}%)"
-        title_surface = self.large_font.render(title, True, (0, 0, 0))
-        screen.blit(title_surface, (position[0] + padding, position[1] + padding))
-        
-        # Show first 10 panels
-        y_pos = position[1] + padding + 30
-        for i, panel_id in enumerate(affected_panels[:10]):
-            if panel_id not in power_output:
-                continue
-            power_data = power_output[panel_id]
-            baseline = power_data.get('baseline', 0)
-            current = power_data.get('final_power', 0)
-            if baseline > 0:
-                reduction = (baseline - current) / baseline * 100
-            else:
-                reduction = 0
-            text = f"{panel_id:<10}   {reduction:>6.1f}%     {current:.2f} kW"
-            if reduction > 50:
-                color = (180, 0, 0)
-            elif reduction > 20:
-                color = (180, 120, 0)
-            else:
-                color = (0, 120, 0)
-            text_surface = self.font.render(text, True, color)
-            screen.blit(text_surface, (position[0] + padding, y_pos))
-            y_pos += line_height
+        return debug_info
     
-    def _draw_time_slider(self, screen, current_hour, sunrise_hour, sunset_hour, position, width):
-        """Draw time slider showing current simulation time"""
-        import pygame
+    def shutdown(self):
+        """Gracefully shutdown the simulation controller."""
+        logger.info("Shutting down SimulationController...")
+        self._shutdown_requested = True
         
-        height = 20
-        day_start = 0
-        day_end = 24
-        day_length = day_end - day_start
-        x_pos = position[0]
-        y_pos = position[1]
+        # Stop physics worker
+        if self.worker:
+            try:
+                self.worker.stop()
+                logger.info("✓ Physics worker thread stopped")
+            except Exception as e:
+                logger.error(f"Error stopping physics worker: {e}")
         
-        # Background
-        bg_rect = pygame.Rect(x_pos, y_pos, width, height)
-        pygame.draw.rect(screen, (220, 220, 220), bg_rect, border_radius=height//2)
-        pygame.draw.rect(screen, (0, 0, 0), bg_rect, width=1, border_radius=height//2)
+        # Cleanup components
+        try:
+            if hasattr(self.weather_system, 'cleanup'):
+                self.weather_system.cleanup()
+            if hasattr(self.shadow_calculator, 'cleanup'):
+                self.shadow_calculator.cleanup()
+            if hasattr(self.power_simulator, 'cleanup'):
+                self.power_simulator.cleanup()
+        except Exception as e:
+            logger.warning(f"Error during component cleanup: {e}")
         
-        # Current time indicator
-        if day_start <= current_hour <= day_end:
-            current_x = x_pos + (current_hour - day_start) / day_length * width
-            pointer_height = 15
-            pointer_width = 10
-            pointer_points = [
-                (current_x, y_pos - 5),
-                (current_x - pointer_width//2, y_pos - 5 - pointer_height),
-                (current_x + pointer_width//2, y_pos - 5 - pointer_height)
-            ]
-            pygame.draw.polygon(screen, (200, 0, 0), pointer_points)
-            
-            hour = int(current_hour)
-            minute = int((current_hour % 1) * 60)
-            time_text = f"{hour:02d}:{minute:02d}"
-            time_surface = self.font.render(time_text, True, (0, 0, 0))
-            time_rect = time_surface.get_rect(center=(current_x, y_pos - 25))
-            screen.blit(time_surface, time_rect)
+        logger.info("✓ SimulationController shutdown complete")
+    
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit."""
+        self.shutdown()
+
+
+# Factory function
+def create_simulation_controller(config_path: Optional[str] = None,
+                                 panel_df: Optional[pd.DataFrame] = None,
+                                 use_threading: bool = True,
+                                 debug_mode: bool = False) -> SimulationController:
+    """
+    Factory function to create a properly configured simulation controller.
+    
+    Args:
+        config_path: Path to configuration file
+        panel_df: Panel DataFrame
+        use_threading: Enable threading mode
+        debug_mode: Enable debug mode
+        
+    Returns:
+        Configured SimulationController instance
+    """
+    if config_path and os.path.exists(config_path):
+        config = SimulationConfig.from_file(config_path)
+    else:
+        config = SimulationConfig()
+    
+    # Apply overrides
+    config.use_threading = use_threading
+    config.debug_mode = debug_mode
+    
+    return SimulationController(config=config, panel_df=panel_df)
+
+
+# Example usage and testing
+if __name__ == "__main__":
+    # Test both threaded and non-threaded modes
+    logger.info("Testing SimulationController...")
+    
+    # Create test panel data
+    test_panels = pd.DataFrame({
+        'panel_id': ['P001', 'P002', 'P003'],
+        'x_km': [1.0, 1.5, 2.0],
+        'y_km': [1.0, 1.5, 2.0],
+        'x': [100, 150, 200],
+        'y': [100, 150, 200],
+        'power_capacity': [5.0, 5.0, 5.0]
+    })
+    
+    # Test non-threaded mode
+    logger.info("Testing non-threaded mode...")
+    controller_direct = create_simulation_controller(
+        panel_df=test_panels,
+        use_threading=False,
+        debug_mode=True
+    )
+    
+    try:
+        for i in range(5):
+            result = controller_direct.step(1/60.0)
+            logger.info(f"Step {i}: clouds={len(result['cloud_ellipses'])}, power={result['total_power']:.1f}kW")
+        
+        stats = controller_direct.get_performance_stats()
+        logger.info(f"Performance: {stats['avg_frame_time_ms']:.2f}ms avg")
+        
+    finally:
+        controller_direct.shutdown()
+    
+    # Test threaded mode
+    logger.info("Testing threaded mode...")
+    controller_threaded = create_simulation_controller(
+        panel_df=test_panels,
+        use_threading=True,
+        debug_mode=True
+    )
+    
+    try:
+        for i in range(5):
+            result = controller_threaded.step(1/60.0)
+            logger.info(f"Step {i}: clouds={len(result['cloud_ellipses'])}, power={result['total_power']:.1f}kW")
+        
+        stats = controller_threaded.get_performance_stats()
+        logger.info(f"Performance: {stats['avg_frame_time_ms']:.2f}ms avg")
+        logger.info(f"Worker queue: dt={stats['worker_dt_queue_size']}, result={stats['worker_result_queue_size']}")
+        
+    finally:
+        controller_threaded.shutdown()
+    
+    logger.info("✓ SimulationController test completed")

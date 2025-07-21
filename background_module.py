@@ -1,815 +1,794 @@
+# background_module.py
 """
-Background module for solar farm simulation
-Handles panel layout, background grid, and static elements
+Complete Environmental Simulation System for Solar Farm Cloud Simulation
+
+Manages environmental conditions with accurate solar position calculation,
+atmospheric modeling, and day/night cycles. Designed for thread-safe operation
+with the physics worker and provides comprehensive environmental data.
+
+Features:
+- Accurate solar position calculation based on time and location
+- Atmospheric modeling (temperature, humidity, pressure, air mass)
+- Day/night cycle with realistic lighting transitions
+- Thread-safe operation for physics worker integration
+- Configurable location and environmental parameters
+- Integration with weather system and CSV coordinate bounds
 """
-import os
-import numpy as np
-import pandas as pd
-import pygame
 import math
-import colorsys
+import time
+import threading
+import copy
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Tuple, Optional, Any, Union
+from dataclasses import dataclass, field
+from functools import lru_cache
+import numpy as np
 
-# OpenGL imports - only imported if OpenGL rendering is used
-try:
-    from OpenGL.GL import *
-    from OpenGL.GL.shaders import compileProgram, compileShader
-    import ctypes
-    OPENGL_AVAILABLE = True
-except ImportError:
-    OPENGL_AVAILABLE = False
-    print("Warning: PyOpenGL not available in background_module. Using Pygame renderer only.")
+@dataclass
+class EnvironmentState:
+    """Complete atmospheric and environmental conditions dataclass."""
+    # Time and location
+    timestamp: float = field(default_factory=time.time)
+    simulation_time: float = 0.0  # Simulation seconds
+    current_hour: float = 12.0    # Local time (0-24)
+    day_of_year: int = field(default_factory=lambda: datetime.now().timetuple().tm_yday)
+    latitude: float = 6.9271      # Degrees north
+    longitude: float = 79.8612    # Degrees east
+    timezone_offset: float = 5.5  # Hours from UTC
+    
+    # Solar position
+    solar_elevation: float = 45.0      # Degrees above horizon
+    solar_azimuth: float = 180.0       # Degrees from north (clockwise)
+    solar_declination: float = 0.0     # Solar declination angle
+    hour_angle: float = 0.0            # Hour angle
+    air_mass: float = 1.0              # Atmospheric air mass factor
+    
+    # Atmospheric conditions
+    ambient_temperature: float = 30.0   # °C
+    humidity: float = 65.0              # Relative humidity (%)
+    pressure: float = 1013.25           # Atmospheric pressure (hPa)
+    atmospheric_clarity: float = 0.75   # Clear sky index (0-1)
+    turbidity: float = 2.5              # Atmospheric turbidity
+    water_vapor: float = 1.5            # Water vapor (cm)
+    ozone: float = 0.3                  # Ozone (atm-cm)
+    
+    # Lighting and visual conditions
+    ambient_light: float = 0.8          # Ambient light level (0-1)
+    shadow_sharpness: float = 0.7       # Shadow sharpness factor (0-1)
+    sky_brightness: float = 0.9         # Sky brightness (0-1)
+    
+    # Environmental dynamics
+    wind_speed: float = 5.0             # Wind speed (m/s)
+    wind_direction: float = 90.0        # Wind direction (degrees)
+    cloud_coverage: float = 25.0        # Cloud coverage percentage
+    
+    # Radiation components
+    direct_normal_irradiance: float = 800.0   # W/m²
+    diffuse_horizontal_irradiance: float = 200.0  # W/m²
+    global_horizontal_irradiance: float = 1000.0  # W/m²
+    
+    # Day/night cycle
+    is_daytime: bool = True
+    sunrise_hour: float = 6.0
+    sunset_hour: float = 18.0
+    daylight_factor: float = 1.0        # 0-1 based on sun position
+    
+    # Simulation metadata
+    time_scale: float = 1.0             # Time acceleration factor
+    location_name: str = "Negombo, Sri Lanka"
 
-def create_panel_dataframe(coordinates_path=None, csv_file=None, num_panels=None):
+class BackgroundModule:
     """
-    Create a DataFrame with solar panel information.
-    
-    Can load from:
-    - coordinates_path/csv_file: Path to CSV with panel coordinates
-    - num_panels: Number of panels to generate in a grid pattern
-    
-    Returns DataFrame with:
-    - panel_id: Unique identifier
-    - x_km, y_km: Position in kilometers
-    - power_capacity: Maximum power in kW
+    Complete environmental simulation system managing atmospheric conditions,
+    solar position, and day/night cycles with thread-safe operation.
     """
-    if coordinates_path is not None or csv_file is not None:
-        # Load from file
-        path = coordinates_path if coordinates_path is not None else csv_file
-        try:
-            df = pd.read_csv(path)
-            # Ensure required columns exist
-            if 'panel_id' not in df.columns:
-                df['panel_id'] = [f"P{i+1:03d}" for i in range(len(df))]
-            if 'power_capacity' not in df.columns:
-                df['power_capacity'] = 5.0  # Default capacity in kW
-                
-            print(f"Loaded {len(df)} panels from {path}")
-            return df
-        except Exception as e:
-            print(f"Error loading panel coordinates from {path}: {e}")
-            print("Falling back to generated panels")
     
-    # Generate panels in a grid pattern
-    if num_panels is None:
-        num_panels = 36  # Default to 6x6 grid
-    
-    # Determine grid dimensions (approximate square)
-    grid_size = int(np.ceil(np.sqrt(num_panels)))
-    
-    # Generate coordinates
-    spacing = 3.0  # km between panels
-    margin = 5.0   # km from edges
-    
-    panel_data = []
-    panel_count = 0
-    
-    for i in range(grid_size):
-        for j in range(grid_size):
-            if panel_count < num_panels:
-                x = margin + i * spacing
-                y = margin + j * spacing
-                
-                # Add some randomization
-                x += np.random.uniform(-0.5, 0.5)
-                y += np.random.uniform(-0.5, 0.5)
-                
-                panel_data.append({
-                    'panel_id': f"P{panel_count+1:03d}",
-                    'x_km': x,
-                    'y_km': y,
-                    'power_capacity': np.random.uniform(4.0, 6.0)  # 4-6 kW capacity
-                })
-                panel_count += 1
-    
-    df = pd.DataFrame(panel_data)
-    print(f"Generated {len(df)} panels in a grid pattern")
-    return df
-
-def setup_background(screen, width, height, x_range, y_range, grid_color=(204, 204, 204)):
-    """
-    Draw the background grid and coordinate system for the simulation.
-    
-    Args:
-        screen: Pygame surface to draw on
-        width, height: Screen dimensions
-        x_range, y_range: Coordinate ranges in km
-        grid_color: Color for grid lines
-    """
-    range_x = x_range[1] - x_range[0]
-    range_y = y_range[1] - y_range[0]
-    
-    # Determine grid spacing based on view range
-    grid_interval_km = 5.0 if range_x > 20 else 2.0
-    
-    # Draw grid lines
-    for x_km in np.arange(x_range[0], x_range[1] + grid_interval_km, grid_interval_km):
-        x_px = int((x_km - x_range[0]) / range_x * width)
-        pygame.draw.line(screen, grid_color, (x_px, 0), (x_px, height), 1)
-    
-    for y_km in np.arange(y_range[0], y_range[1] + grid_interval_km, grid_interval_km):
-        y_px = int((y_km - y_range[0]) / range_y * height)
-        pygame.draw.line(screen, grid_color, (0, y_px), (width, y_px), 1)
-    
-    # Draw coordinate labels
-    font = pygame.font.SysFont('Arial', 12)
-    
-    # Determine label spacing
-    tick_interval = 10 if range_x > 20 else 5
-    
-    # X-axis labels
-    for x_km in np.arange(int(x_range[0]), int(x_range[1])+1, tick_interval):
-        x_px = int((x_km - x_range[0]) / range_x * width)
-        label = font.render(f"{int(x_km)}", True, (0, 0, 0))
-        screen.blit(label, (x_px - 5, height - 20))
-    
-    # Y-axis labels
-    for y_km in np.arange(int(y_range[0]), int(y_range[1])+1, tick_interval):
-        y_px = int((y_km - y_range[0]) / range_y * height)
-        label = font.render(f"{int(y_km)}", True, (0, 0, 0))
-        screen.blit(label, (5, y_px - 10))
-    
-    # Axis titles
-    x_label = font.render("Distance (km)", True, (0, 0, 0))
-    screen.blit(x_label, (width // 2 - 40, height - 20))
-    
-    y_label = font.render("Distance (km)", True, (0, 0, 0))
-    y_label = pygame.transform.rotate(y_label, 90)
-    screen.blit(y_label, (5, height // 2 - 40))
-
-def km_to_screen_coords(x_km, y_km, x_range, y_range, screen_width, screen_height):
-    """Convert km coordinates to screen pixels"""
-    range_x = x_range[1] - x_range[0]
-    range_y = y_range[1] - y_range[0]
-    screen_x = int((x_km - x_range[0]) / range_x * screen_width)
-    screen_y = int((y_km - y_range[0]) / range_y * screen_height)
-    return screen_x, screen_y
-
-def screen_to_km_coords(screen_x, screen_y, x_range, y_range, screen_width, screen_height):
-    """Convert screen pixels to km coordinates"""
-    range_x = x_range[1] - x_range[0]
-    range_y = y_range[1] - y_range[0]
-    x_km = x_range[0] + (screen_x / screen_width) * range_x
-    y_km = y_range[0] + (screen_y / screen_height) * range_y
-    return x_km, y_km
-
-def draw_solar_panels(screen, panel_df, panel_coverage, power_output, x_range, y_range, width, height):
-    """
-    Draw solar panels with power output visualization.
-    
-    Args:
-        screen: Pygame surface to draw on
-        panel_df: DataFrame with panel information
-        panel_coverage: Dict mapping panel_id to coverage percentage
-        power_output: Dict mapping panel_id to power output info
-        x_range, y_range: Coordinate ranges in km
-        width, height: Screen dimensions
-    
-    Returns:
-        List of affected panel IDs sorted by coverage.
-    """
-    range_x = x_range[1] - x_range[0]
-    range_y = y_range[1] - y_range[0]
-    panel_size_km = 0.4  # Default panel size
-    panel_size_px = int(panel_size_km / range_x * width)
-    
-    affected_panels = []
-    
-    for _, row in panel_df.iterrows():
-        panel_id = row["panel_id"]
-        x_km = row["x_km"]
-        y_km = row["y_km"]
+    def __init__(self, latitude: float = 6.9271, longitude: float = 79.8612,
+                 timezone_offset: float = 5.5, elevation_m: float = 10.0,
+                 time_scale: float = 1.0):
+        """
+        Initialize the background environmental simulation module.
         
-        # Convert to screen coordinates
-        x_px, y_px = km_to_screen_coords(x_km, y_km, x_range, y_range, width, height)
+        Args:
+            latitude: Site latitude in degrees (negative for south)
+            longitude: Site longitude in degrees (negative for west)  
+            timezone_offset: Hours from UTC (positive for east)
+            elevation_m: Site elevation in meters above sea level
+            time_scale: Time acceleration factor (1.0 = real time)
+        """
+        # Location and time configuration
+        self.latitude = latitude
+        self.longitude = longitude
+        self.timezone_offset = timezone_offset
+        self.elevation_m = elevation_m
+        self.time_scale = time_scale
         
-        # Determine panel color based on coverage and power
-        coverage = panel_coverage.get(panel_id, 0.0)
-        
-        if coverage > 0:
-            affected_panels.append((panel_id, coverage))
-        
-        # Get power output
-        power_data = power_output.get(panel_id, {})
-        power_value = power_data.get('final_power', 0)
-        max_power = power_data.get('baseline', 1.0)
-        
-        # Normalize power for color
-        power_pct = min(1.0, max(0.0, power_value / max_power if max_power > 0 else 0))
-        
-        # Calculate color from power percentage (blue to red)
-        if power_pct > 0.8:
-            # High power - blue to green gradient
-            h = 0.6 - (power_pct - 0.8) * 0.6 / 0.2  # 0.6 (blue) to 0.3 (green)
-            s = 0.8
-            v = 0.9
-        else:
-            # Lower power - green to red gradient
-            h = 0.3 - (0.8 - power_pct) * 0.3 / 0.8  # 0.3 (green) to 0 (red)
-            s = 0.8
-            v = 0.8
-        
-        r, g, b = colorsys.hsv_to_rgb(h, s, v)
-        panel_color = (int(r * 255), int(g * 255), int(b * 255))
-        
-        # Draw panel
-        panel_rect = pygame.Rect(
-            x_px - panel_size_px//2, 
-            y_px - panel_size_px//2, 
-            panel_size_px, 
-            panel_size_px
+        # Environmental state
+        self.environment_state = EnvironmentState(
+            latitude=latitude,
+            longitude=longitude,
+            timezone_offset=timezone_offset,
+            time_scale=time_scale
         )
-        pygame.draw.rect(screen, panel_color, panel_rect)
         
-        # Add border
-        border_color = (0, 0, 0)
-        pygame.draw.rect(screen, border_color, panel_rect, width=1)
+        # Threading support
+        self.thread_safe_mode = False
+        self._lock = threading.RLock()
         
-        # Draw coverage indicator if covered
-        if coverage > 0.05:
-            # Draw shadow effect
-            shadow_size = int(panel_size_px * coverage)
-            shadow_color = (0, 0, 0, 120)  # Semi-transparent black
-            
-            shadow_surface = pygame.Surface((shadow_size, shadow_size), pygame.SRCALPHA)
-            pygame.draw.rect(shadow_surface, shadow_color, (0, 0, shadow_size, shadow_size))
-            
-            shadow_pos = (
-                x_px - shadow_size//2,
-                y_px - shadow_size//2
-            )
-            screen.blit(shadow_surface, shadow_pos)
+        # Time management
+        self.simulation_start_time = time.time()
+        self.last_update_time = time.time()
+        self.simulation_time = 0.0
         
-        # Draw panel ID if we don't have too many panels
-        if len(panel_df) < 100:
-            font_size = 9 if len(panel_df) < 60 else 7
-            font = pygame.font.SysFont('Arial', font_size)
-            label = font.render(panel_id, True, (255, 255, 255))
-            label_rect = label.get_rect(center=(x_px, y_px))
-            screen.blit(label, label_rect)
+        # Environmental parameter ranges for realistic variations
+        self.temperature_range = (25.0, 35.0)  # °C for tropical location
+        self.humidity_range = (60.0, 90.0)     # % for tropical climate
+        self.pressure_range = (1008.0, 1018.0) # hPa typical range
+        
+        # Solar position calculation cache
+        self.solar_position_cache = {}
+        self.cache_precision = 0.1  # Cache solar positions to 0.1 hour precision
+        
+        # Atmospheric model parameters
+        self.atmospheric_params = {
+            'rayleigh_scattering': 0.0903,
+            'aerosol_optical_depth': 0.1,
+            'water_vapor_absorption': 0.2385,
+            'ozone_absorption': 1.0,
+            'mixed_gas_absorption': 0.0127
+        }
+        
+        # Day/night cycle parameters
+        self.twilight_duration = 1.0  # Hours for sunrise/sunset transition
+        
+        # Performance tracking
+        self.update_count = 0
+        self.last_performance_check = time.time()
+        
+        # Initialize with current conditions
+        self._update_solar_position()
+        self._update_atmospheric_conditions()
+        self._update_day_night_cycle()
+        
+        print(f"BackgroundModule initialized:")
+        print(f"  Location: {latitude:.3f}°N, {longitude:.3f}°E")
+        print(f"  Elevation: {elevation_m}m")
+        print(f"  Timezone: UTC{timezone_offset:+.1f}")
+        print(f"  Time scale: {time_scale}x")
+        print(f"  Current conditions: {self.environment_state.ambient_temperature:.1f}°C, "
+              f"{self.environment_state.humidity:.0f}% humidity")
     
-    # Sort affected panels by coverage
-    affected_panels.sort(key=lambda x: x[1], reverse=True)
-    return [panel_id for panel_id, _ in affected_panels]
-
-def create_ui_element(text, position, size, font_size=16, bg_color=(255, 255, 255, 200), text_color=(0, 0, 0)):
-    """Create a UI element with text"""
-    surface = pygame.Surface(size, pygame.SRCALPHA)
-    surface.fill(bg_color)
+    def set_thread_safe_mode(self, enabled: bool):
+        """Enable or disable thread-safe mode for worker thread operation."""
+        self.thread_safe_mode = enabled
+        if enabled:
+            print("BackgroundModule: Thread-safe mode enabled")
     
-    font = pygame.font.SysFont('Arial', font_size)
-    text_surface = font.render(text, True, text_color)
-    text_rect = text_surface.get_rect(center=(size[0]//2, size[1]//2))
-    
-    surface.blit(text_surface, text_rect)
-    
-    return surface
-
-
-# ===== OpenGL Background Grid Renderer =====
-
-class GLGridRenderer:
-    """OpenGL-based grid renderer for background"""
-    
-    # Vertex shader for grid lines
-    VERTEX_SHADER = """
-    #version 330 core
-    layout(location = 0) in vec2 position;
-    
-    uniform mat4 projection;
-    
-    void main() {
-        gl_Position = projection * vec4(position, 0.0, 1.0);
-    }
-    """
-    
-    # Fragment shader for grid lines
-    FRAGMENT_SHADER = """
-    #version 330 core
-    out vec4 fragColor;
-    
-    uniform vec4 lineColor;
-    
-    void main() {
-        fragColor = lineColor;
-    }
-    """
-    
-    def __init__(self, screen_size):
-        """Initialize the OpenGL grid renderer
+    def update(self, dt: float):
+        """
+        Update environmental conditions for the given time step.
         
         Args:
-            screen_size: Tuple of (width, height) in pixels
+            dt: Delta time in seconds
         """
-        self.screen_size = screen_size
-        self.initialized = False
-        self.shader_program = None
-        self.vao = None
-        self.vbo = None
-        self.projection_matrix = self._create_ortho_matrix(0, screen_size[0], screen_size[1], 0, -1, 1)
-        
-    def init_gl(self):
-        """Initialize OpenGL resources for grid rendering"""
-        if self.initialized:
-            return True
-            
-        try:
-            # Compile shaders
-            self.shader_program = compileProgram(
-                compileShader(self.VERTEX_SHADER, GL_VERTEX_SHADER),
-                compileShader(self.FRAGMENT_SHADER, GL_FRAGMENT_SHADER)
-            )
-            
-            # Set up VAO
-            self.vao = glGenVertexArrays(1)
-            
-            # Set up VBO (will be populated in render)
-            self.vbo = glGenBuffers(1)
-            
-            self.initialized = True
-            return True
-        except Exception as e:
-            print(f"Error initializing GL grid renderer: {e}")
-            return False
-        
-    def _create_ortho_matrix(self, left, right, bottom, top, near, far):
-        """Create an orthographic projection matrix"""
-        width = right - left
-        height = top - bottom
-        depth = far - near
-        
-        return np.array([
-            [2/width, 0, 0, -(right + left)/width],
-            [0, 2/height, 0, -(top + bottom)/height],
-            [0, 0, -2/depth, -(far + near)/depth],
-            [0, 0, 0, 1]
-        ], dtype=np.float32)
+        if self.thread_safe_mode:
+            with self._lock:
+                self._update_internal(dt)
+        else:
+            self._update_internal(dt)
     
-    def render_grid(self, x_range, y_range, width, height, grid_color=(0.8, 0.8, 0.8, 1.0)):
-        """Render background grid with OpenGL
+    def _update_internal(self, dt: float):
+        """Internal update implementation with environmental progression."""
+        current_time = time.time()
         
-        Args:
-            x_range, y_range: Coordinate ranges in km
-            width, height: Screen dimensions
-            grid_color: Color for grid lines (RGBA, 0-1 range)
-        """
-        if not self.initialized and not self.init_gl():
-            print("Failed to initialize OpenGL for grid. Skipping rendering.")
+        # Update simulation time with time scale
+        self.simulation_time += dt * self.time_scale
+        
+        # Update current hour (0-24) based on simulation time
+        hours_elapsed = self.simulation_time / 3600.0
+        self.environment_state.current_hour = (12.0 + hours_elapsed) % 24.0  # Start at noon
+        self.environment_state.simulation_time = self.simulation_time
+        self.environment_state.timestamp = current_time
+        
+        # Update day of year if significant time has passed
+        if self.time_scale > 24.0:  # If accelerated enough to matter
+            days_elapsed = hours_elapsed / 24.0
+            start_day = datetime.now().timetuple().tm_yday
+            self.environment_state.day_of_year = int(start_day + days_elapsed) % 365 + 1
+        
+        # Update environmental components
+        self._update_solar_position()
+        self._update_atmospheric_conditions()
+        self._update_day_night_cycle()
+        self._update_environmental_variations(dt)
+        
+        # Update performance tracking
+        self.update_count += 1
+        self.last_update_time = current_time
+    
+    def _update_solar_position(self):
+        """Calculate accurate solar position based on time and location."""
+        # Create cache key for solar position (precision to 0.1 hour)
+        cache_key = (
+            round(self.environment_state.current_hour / self.cache_precision) * self.cache_precision,
+            self.environment_state.day_of_year,
+            round(self.latitude, 2),
+            round(self.longitude, 2)
+        )
+        
+        # Check cache first
+        if cache_key in self.solar_position_cache:
+            cached_result = self.solar_position_cache[cache_key]
+            self.environment_state.solar_elevation = cached_result['elevation']
+            self.environment_state.solar_azimuth = cached_result['azimuth']
+            self.environment_state.solar_declination = cached_result['declination']
+            self.environment_state.hour_angle = cached_result['hour_angle']
+            self.environment_state.air_mass = cached_result['air_mass']
             return
         
-        range_x = x_range[1] - x_range[0]
-        range_y = y_range[1] - y_range[0]
+        # Calculate solar position from scratch
+        hour = self.environment_state.current_hour
+        day_of_year = self.environment_state.day_of_year
+        lat = self.latitude
+        lon = self.longitude
         
-        # Determine grid spacing based on view range
-        grid_interval_km = 5.0 if range_x > 20 else 2.0
+        # Solar declination angle (varies seasonally)
+        declination_rad = math.radians(23.45 * math.sin(math.radians(360 * (284 + day_of_year) / 365)))
+        declination = math.degrees(declination_rad)
         
-        # Prepare vertices for grid lines
-        vertices = []
+        # Hour angle (15 degrees per hour from solar noon)
+        solar_time = hour + lon / 15.0 - self.timezone_offset
+        hour_angle_rad = math.radians(15 * (solar_time - 12))
+        hour_angle = math.degrees(hour_angle_rad)
         
-        # Vertical grid lines
-        for x_km in np.arange(x_range[0], x_range[1] + grid_interval_km, grid_interval_km):
-            x_px = int((x_km - x_range[0]) / range_x * width)
-            vertices.extend([x_px, 0, x_px, height])
+        # Solar elevation angle
+        lat_rad = math.radians(lat)
+        sin_elevation = (math.sin(declination_rad) * math.sin(lat_rad) + 
+                        math.cos(declination_rad) * math.cos(lat_rad) * math.cos(hour_angle_rad))
+        elevation_rad = math.asin(max(-1, min(1, sin_elevation)))
+        elevation = math.degrees(elevation_rad)
         
-        # Horizontal grid lines
-        for y_km in np.arange(y_range[0], y_range[1] + grid_interval_km, grid_interval_km):
-            y_px = int((y_km - y_range[0]) / range_y * height)
-            vertices.extend([0, y_px, width, y_px])
-        
-        # Convert to numpy array
-        vertices = np.array(vertices, dtype=np.float32)
-        
-        # Prepare for rendering
-        glUseProgram(self.shader_program)
-        
-        # Set projection matrix uniform
-        proj_loc = glGetUniformLocation(self.shader_program, "projection")
-        glUniformMatrix4fv(proj_loc, 1, GL_FALSE, self.projection_matrix)
-        
-        # Set line color uniform
-        color_loc = glGetUniformLocation(self.shader_program, "lineColor")
-        glUniform4fv(color_loc, 1, grid_color)
-        
-        # Bind VAO
-        glBindVertexArray(self.vao)
-        
-        # Update VBO with vertices
-        glBindBuffer(GL_ARRAY_BUFFER, self.vbo)
-        glBufferData(GL_ARRAY_BUFFER, vertices.nbytes, vertices, GL_STATIC_DRAW)
-        
-        # Set vertex attributes
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, None)
-        glEnableVertexAttribArray(0)
-        
-        # Draw grid lines
-        glDrawArrays(GL_LINES, 0, len(vertices) // 2)
-        
-        # Clean up
-        glBindVertexArray(0)
-        glUseProgram(0)
-
-
-# ===== OpenGL Panel Renderer =====
-
-class GLPanelRenderer:
-    """OpenGL-based renderer for solar panels with advanced visual effects"""
-    
-    # Vertex shader for panels
-    VERTEX_SHADER = """
-    #version 330 core
-    layout(location = 0) in vec2 position;
-    layout(location = 1) in vec2 texCoords;
-    
-    out vec2 fragTexCoords;
-    out vec2 panelCoord;
-    
-    uniform mat4 projection;
-    uniform mat4 model;
-    
-    void main() {
-        gl_Position = projection * model * vec4(position, 0.0, 1.0);
-        fragTexCoords = texCoords;
-        panelCoord = position;
-    }
-    """
-    
-    # Fragment shader for panels with power-based coloring and shadow effects
-    FRAGMENT_SHADER = """
-    #version 330 core
-    in vec2 fragTexCoords;
-    in vec2 panelCoord;
-    
-    out vec4 fragColor;
-    
-    uniform float powerPercentage;  // 0.0 to 1.0
-    uniform float coverage;         // 0.0 to 1.0
-    uniform vec2 highlightCenter;   // -0.5 to 0.5 for reflection highlight
-    uniform float time;             // For animations
-    uniform bool isHighlighted;     // For selected panel
-    
-    // Gradient colors for power levels
-    vec3 highPowerColor = vec3(0.0, 0.0, 1.0);    // Blue
-    vec3 medPowerColor = vec3(0.0, 0.8, 0.0);     // Green
-    vec3 lowPowerColor = vec3(1.0, 0.0, 0.0);     // Red
-    
-    void main() {
-        // Panel border effect
-        float border = 0.03;
-        bool isBorder = abs(fragTexCoords.x - 0.5) > (0.5 - border) || 
-                       abs(fragTexCoords.y - 0.5) > (0.5 - border);
-        
-        // Calculate base color based on power percentage
-        vec3 baseColor;
-        if (powerPercentage > 0.8) {
-            // High power - blue to green gradient
-            float t = (powerPercentage - 0.8) / 0.2;
-            baseColor = mix(medPowerColor, highPowerColor, t);
-        } else {
-            // Lower power - green to red gradient
-            float t = powerPercentage / 0.8;
-            baseColor = mix(lowPowerColor, medPowerColor, t);
-        }
-        
-        // Apply solar panel cell pattern
-        float cellSize = 0.2;
-        float cellX = mod(fragTexCoords.x / cellSize, 1.0);
-        float cellY = mod(fragTexCoords.y / cellSize, 1.0);
-        float cellBorder = 0.05;
-        bool isGridline = cellX < cellBorder || cellY < cellBorder;
-        
-        // Darkened gridlines
-        if (isGridline) {
-            baseColor *= 0.7;
-        }
-        
-        // Add subtle highlight based on angle (simulates reflective surface)
-        float highlightDistance = distance(fragTexCoords, highlightCenter + vec2(0.5));
-        float highlight = smoothstep(0.4, 0.0, highlightDistance) * 0.3;
-        baseColor += vec3(highlight);
-        
-        // Apply border
-        vec3 borderColor = vec3(0.1, 0.1, 0.1);
-        if (isBorder) {
-            baseColor = borderColor;
-        }
-        
-        // Apply cloud shadow effect
-        float shadowIntensity = coverage * 0.8;
-        if (coverage > 0.05) {
-            baseColor *= (1.0 - shadowIntensity);
-        }
-        
-        // Apply highlight effect for selected panel
-        if (isHighlighted) {
-            float pulseEffect = (sin(time * 5.0) + 1.0) * 0.5;  // 0 to 1 pulsing
+        # Solar azimuth angle
+        if elevation > 0:
+            cos_azimuth = ((math.sin(declination_rad) * math.cos(lat_rad) - 
+                           math.cos(declination_rad) * math.sin(lat_rad) * math.cos(hour_angle_rad)) / 
+                           math.cos(elevation_rad))
+            cos_azimuth = max(-1, min(1, cos_azimuth))
+            azimuth_rad = math.acos(cos_azimuth)
             
-            if (isBorder) {
-                // Bright pulsing border
-                baseColor = mix(vec3(1.0, 1.0, 0.4), vec3(0.0, 1.0, 0.0), pulseEffect);
-            } else {
-                // Subtle inner glow
-                baseColor += vec3(0.1, 0.1, 0.0) * pulseEffect;
-            }
+            if hour_angle > 0:  # Afternoon
+                azimuth = math.degrees(azimuth_rad)
+            else:  # Morning
+                azimuth = 360 - math.degrees(azimuth_rad)
+        else:
+            azimuth = 0  # Sun below horizon
+        
+        # Atmospheric air mass calculation
+        if elevation > 0:
+            air_mass = 1 / (math.sin(elevation_rad) + 0.50572 * ((elevation + 6.07995) ** -1.6364))
+            # Apply elevation correction
+            air_mass *= math.exp(-self.elevation_m / 8400.0)  # Scale height ~8.4km
+        else:
+            air_mass = float('inf')
+        
+        # Limit air mass to reasonable values
+        air_mass = min(air_mass, 38.0)
+        
+        # Store results
+        result = {
+            'elevation': max(0, elevation),
+            'azimuth': azimuth,
+            'declination': declination,
+            'hour_angle': hour_angle,
+            'air_mass': air_mass
         }
         
-        fragColor = vec4(baseColor, 1.0);
-    }
-    """
-    
-    def __init__(self, screen_size):
-        """Initialize the OpenGL panel renderer
+        # Cache result
+        self.solar_position_cache[cache_key] = result
         
-        Args:
-            screen_size: Tuple of (width, height) in pixels
+        # Limit cache size
+        if len(self.solar_position_cache) > 1000:
+            # Remove oldest entries
+            keys_to_remove = list(self.solar_position_cache.keys())[:500]
+            for key in keys_to_remove:
+                del self.solar_position_cache[key]
+        
+        # Update environment state
+        self.environment_state.solar_elevation = result['elevation']
+        self.environment_state.solar_azimuth = result['azimuth']
+        self.environment_state.solar_declination = result['declination']
+        self.environment_state.hour_angle = result['hour_angle']
+        self.environment_state.air_mass = result['air_mass']
+    
+    def _update_atmospheric_conditions(self):
+        """Update atmospheric conditions based on solar position and time."""
+        elevation = self.environment_state.solar_elevation
+        air_mass = self.environment_state.air_mass
+        
+        # Calculate solar irradiance components
+        if elevation > 0:
+            # Solar constant with Earth-Sun distance correction
+            day_of_year = self.environment_state.day_of_year
+            B = 2 * math.pi * (day_of_year - 1) / 365
+            distance_correction = (1.000110 + 0.034221 * math.cos(B) + 
+                                 0.001280 * math.sin(B) + 0.000719 * math.cos(2*B) + 
+                                 0.000077 * math.sin(2*B))
+            
+            extraterrestrial_irradiance = 1367.0 * distance_correction
+            
+            # Atmospheric transmission calculations
+            elevation_rad = math.radians(elevation)
+            
+            # Rayleigh scattering
+            tau_r = math.exp(-self.atmospheric_params['rayleigh_scattering'] * 
+                           (air_mass ** 0.84) * (1 + air_mass - (air_mass ** 1.01)))
+            
+            # Aerosol extinction
+            tau_a = math.exp(-air_mass * self.atmospheric_params['aerosol_optical_depth'])
+            
+            # Water vapor absorption
+            tau_w = math.exp(-self.atmospheric_params['water_vapor_absorption'] * 
+                           self.environment_state.water_vapor * air_mass / 
+                           (1 + 20.07 * self.environment_state.water_vapor * air_mass) ** 0.45)
+            
+            # Ozone absorption
+            tau_o = math.exp(-air_mass * self.environment_state.ozone * 
+                           (1 + 139.48 * self.environment_state.ozone) ** -0.3035 - 
+                           0.02715 * self.environment_state.ozone / 
+                           (1 + 0.0316 * self.environment_state.ozone))
+            
+            # Mixed gas absorption
+            tau_g = math.exp(-self.atmospheric_params['mixed_gas_absorption'] * (air_mass ** 0.26))
+            
+            # Direct normal irradiance
+            dni = extraterrestrial_irradiance * tau_r * tau_a * tau_w * tau_o * tau_g
+            
+            # Diffuse horizontal irradiance (simplified model)
+            dhi = extraterrestrial_irradiance * math.sin(elevation_rad) * 0.095 * \
+                  (1 - tau_r * tau_a * tau_w * tau_o * tau_g)
+            
+            # Global horizontal irradiance
+            ghi = dni * math.sin(elevation_rad) + dhi
+            
+            # Update irradiance values
+            self.environment_state.direct_normal_irradiance = max(0, dni)
+            self.environment_state.diffuse_horizontal_irradiance = max(0, dhi)
+            self.environment_state.global_horizontal_irradiance = max(0, ghi)
+            
+            # Calculate atmospheric clarity
+            clear_sky_ghi = extraterrestrial_irradiance * math.sin(elevation_rad) * 0.75
+            self.environment_state.atmospheric_clarity = min(1.0, ghi / clear_sky_ghi if clear_sky_ghi > 0 else 0.75)
+            
+        else:
+            # Nighttime - no solar irradiance
+            self.environment_state.direct_normal_irradiance = 0.0
+            self.environment_state.diffuse_horizontal_irradiance = 0.0
+            self.environment_state.global_horizontal_irradiance = 0.0
+            self.environment_state.atmospheric_clarity = 0.0
+        
+        # Update shadow sharpness based on atmospheric conditions
+        if elevation > 5:  # Only during significant daylight
+            base_sharpness = 0.9
+            clarity_factor = self.environment_state.atmospheric_clarity
+            humidity_factor = 1.0 - (self.environment_state.humidity - 50.0) / 100.0  # Higher humidity = softer shadows
+            self.environment_state.shadow_sharpness = base_sharpness * clarity_factor * max(0.3, humidity_factor)
+        else:
+            self.environment_state.shadow_sharpness = 0.0
+    
+    def _update_day_night_cycle(self):
+        """Update day/night cycle and lighting conditions."""
+        elevation = self.environment_state.solar_elevation
+        hour = self.environment_state.current_hour
+        
+        # Calculate sunrise and sunset times (simplified for tropical location)
+        day_of_year = self.environment_state.day_of_year
+        
+        # Seasonal variation (less pronounced near equator)
+        seasonal_variation = 0.5 * math.sin(2 * math.pi * (day_of_year - 80) / 365)
+        base_day_length = 12.0  # Hours for equatorial location
+        
+        sunrise_hour = 6.0 - seasonal_variation
+        sunset_hour = 18.0 + seasonal_variation
+        
+        self.environment_state.sunrise_hour = sunrise_hour
+        self.environment_state.sunset_hour = sunset_hour
+        
+        # Determine if it's daytime
+        self.environment_state.is_daytime = sunrise_hour <= hour <= sunset_hour
+        
+        # Calculate daylight factor (0-1) with smooth transitions
+        if elevation > 0:
+            # Full daylight
+            daylight_factor = min(1.0, elevation / 45.0)
+        elif hour < sunrise_hour - self.twilight_duration or hour > sunset_hour + self.twilight_duration:
+            # Full nighttime
+            daylight_factor = 0.0
+        else:
+            # Twilight transition
+            if hour < sunrise_hour:
+                # Dawn twilight
+                twilight_progress = (sunrise_hour - hour) / self.twilight_duration
+                daylight_factor = max(0.0, 1.0 - twilight_progress) * 0.3
+            else:
+                # Dusk twilight
+                twilight_progress = (hour - sunset_hour) / self.twilight_duration
+                daylight_factor = max(0.0, 1.0 - twilight_progress) * 0.3
+        
+        self.environment_state.daylight_factor = daylight_factor
+        
+        # Update ambient light based on daylight factor and atmospheric conditions
+        base_ambient = 0.1 + 0.9 * daylight_factor
+        clarity_bonus = self.environment_state.atmospheric_clarity * 0.1
+        self.environment_state.ambient_light = min(1.0, base_ambient + clarity_bonus)
+        
+        # Update sky brightness
+        if daylight_factor > 0.1:
+            sky_brightness = 0.3 + 0.7 * daylight_factor
+        else:
+            sky_brightness = 0.05 + 0.25 * daylight_factor  # Moonlight and stars
+        
+        self.environment_state.sky_brightness = sky_brightness
+    
+    def _update_environmental_variations(self, dt: float):
+        """Update environmental parameters with realistic variations."""
+        # Temperature variation based on solar irradiance and time of day
+        base_temp = 25.0 + 10.0 * self.environment_state.daylight_factor
+        
+        # Add daily temperature cycle
+        hour_factor = math.sin(2 * math.pi * (self.environment_state.current_hour - 6) / 24)
+        temp_variation = 3.0 * hour_factor
+        
+        # Add gradual drift
+        time_factor = math.sin(self.simulation_time * 0.001) * 2.0
+        
+        target_temp = base_temp + temp_variation + time_factor
+        target_temp = max(self.temperature_range[0], min(self.temperature_range[1], target_temp))
+        
+        # Smooth temperature changes
+        temp_change_rate = 1.0  # degrees per hour
+        max_change = temp_change_rate * dt / 3600.0
+        temp_diff = target_temp - self.environment_state.ambient_temperature
+        temp_change = max(-max_change, min(max_change, temp_diff))
+        
+        self.environment_state.ambient_temperature += temp_change
+        
+        # Humidity variation (inverse relationship with temperature during day)
+        base_humidity = 75.0
+        temp_humidity_factor = -0.5 * (self.environment_state.ambient_temperature - 27.0)
+        time_humidity_factor = 10.0 * math.sin(self.simulation_time * 0.002 + math.pi)
+        
+        target_humidity = base_humidity + temp_humidity_factor + time_humidity_factor
+        target_humidity = max(self.humidity_range[0], min(self.humidity_range[1], target_humidity))
+        
+        # Smooth humidity changes
+        humidity_change_rate = 5.0  # percent per hour
+        max_humidity_change = humidity_change_rate * dt / 3600.0
+        humidity_diff = target_humidity - self.environment_state.humidity
+        humidity_change = max(-max_humidity_change, min(max_humidity_change, humidity_diff))
+        
+        self.environment_state.humidity += humidity_change
+        
+        # Pressure variation (realistic daily cycle)
+        base_pressure = 1013.25
+        pressure_cycle = 2.0 * math.sin(2 * math.pi * self.environment_state.current_hour / 24)
+        pressure_drift = 1.0 * math.sin(self.simulation_time * 0.0005)
+        
+        target_pressure = base_pressure + pressure_cycle + pressure_drift
+        self.environment_state.pressure = max(self.pressure_range[0], 
+                                            min(self.pressure_range[1], target_pressure))
+        
+        # Update turbidity based on humidity and time
+        base_turbidity = 2.5
+        humidity_turbidity = (self.environment_state.humidity - 60.0) / 100.0
+        time_turbidity = 0.5 * math.sin(self.simulation_time * 0.001)
+        
+        self.environment_state.turbidity = max(1.5, min(4.0, 
+            base_turbidity + humidity_turbidity + time_turbidity))
+    
+    def get_state(self) -> EnvironmentState:
         """
-        self.screen_size = screen_size
-        self.initialized = False
-        self.shader_program = None
-        self.vao = None
-        self.vbo = None
-        self.projection_matrix = self._create_ortho_matrix(0, screen_size[0], screen_size[1], 0, -1, 1)
-        self.highlighted_panel = None
-        self.start_time = pygame.time.get_ticks() / 1000.0
-    
-    def init_gl(self):
-        """Initialize OpenGL context and resources"""
-        if self.initialized:
-            return True
-            
-        # Compile shaders
-        try:
-            self.shader_program = compileProgram(
-                compileShader(self.VERTEX_SHADER, GL_VERTEX_SHADER),
-                compileShader(self.FRAGMENT_SHADER, GL_FRAGMENT_SHADER)
-            )
-        except Exception as e:
-            print(f"Error compiling panel shaders: {e}")
-            return False
-        
-        # Create a quad for panels
-        vertices = np.array([
-            # x, y, u, v
-            -0.5, -0.5, 0.0, 0.0,  # Bottom left
-             0.5, -0.5, 1.0, 0.0,  # Bottom right
-             0.5,  0.5, 1.0, 1.0,  # Top right
-            -0.5,  0.5, 0.0, 1.0   # Top left
-        ], dtype=np.float32)
-        
-        # Indices for quad
-        indices = np.array([
-            0, 1, 2,  # First triangle
-            2, 3, 0   # Second triangle
-        ], dtype=np.uint32)
-        
-        # Create and bind VAO
-        self.vao = glGenVertexArrays(1)
-        glBindVertexArray(self.vao)
-        
-        # Create and bind VBO
-        self.vbo = glGenBuffers(1)
-        glBindBuffer(GL_ARRAY_BUFFER, self.vbo)
-        glBufferData(GL_ARRAY_BUFFER, vertices.nbytes, vertices, GL_STATIC_DRAW)
-        
-        # Create and bind EBO
-        self.ebo = glGenBuffers(1)
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, self.ebo)
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.nbytes, indices, GL_STATIC_DRAW)
-        
-        # Position attribute
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * vertices.itemsize, ctypes.c_void_p(0))
-        glEnableVertexAttribArray(0)
-        
-        # Texture coord attribute
-        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * vertices.itemsize, ctypes.c_void_p(2 * vertices.itemsize))
-        glEnableVertexAttribArray(1)
-        
-        # Unbind VAO
-        glBindVertexArray(0)
-        
-        self.initialized = True
-        return True
-    
-    def _create_ortho_matrix(self, left, right, bottom, top, near, far):
-        """Create an orthographic projection matrix"""
-        width = right - left
-        height = top - bottom
-        depth = far - near
-        
-        return np.array([
-            [2/width, 0, 0, -(right + left)/width],
-            [0, 2/height, 0, -(top + bottom)/height],
-            [0, 0, -2/depth, -(far + near)/depth],
-            [0, 0, 0, 1]
-        ], dtype=np.float32)
-    
-    def render_panels(self, panel_df, panel_coverage, power_output, x_range, y_range, width, height):
-        """Render solar panels with OpenGL
-        
-        Args:
-            panel_df: DataFrame with panel information
-            panel_coverage: Dictionary mapping panel_id to coverage (0-1)
-            power_output: Dictionary mapping panel_id to power output information
-            x_range, y_range: Coordinate ranges in km
-            width, height: Screen dimensions
+        Get complete environmental data.
         
         Returns:
-            List of affected panel IDs sorted by coverage
+            Deep copy of current EnvironmentState
         """
-        if not self.initialized and not self.init_gl():
-            print("Failed to initialize OpenGL for panels. Skipping rendering.")
-            return []
-        
-        # Prepare for rendering
-        glUseProgram(self.shader_program)
-        glBindVertexArray(self.vao)
-        
-        # Set projection matrix uniform
-        proj_loc = glGetUniformLocation(self.shader_program, "projection")
-        glUniformMatrix4fv(proj_loc, 1, GL_FALSE, self.projection_matrix)
-        
-        # Set time uniform for animations
-        current_time = pygame.time.get_ticks() / 1000.0 - self.start_time
-        time_loc = glGetUniformLocation(self.shader_program, "time")
-        glUniform1f(time_loc, current_time)
-        
-        # Range conversion factors
-        range_x = x_range[1] - x_range[0]
-        range_y = y_range[1] - y_range[0]
-        panel_size_km = 0.4  # Default panel size
-        panel_size_px = int(panel_size_km / range_x * width)
-        
-        affected_panels = []
-        
-        # Render each panel
-        for _, row in panel_df.iterrows():
-            panel_id = row["panel_id"]
-            x_km = row["x_km"]
-            y_km = row["y_km"]
-            
-            # Convert to screen coordinates
-            x_px, y_px = km_to_screen_coords(x_km, y_km, x_range, y_range, width, height)
-            
-            # Determine panel color based on coverage and power
-            coverage = panel_coverage.get(panel_id, 0.0)
-            
-            if coverage > 0:
-                affected_panels.append((panel_id, coverage))
-            
-            # Get power output
-            power_data = power_output.get(panel_id, {})
-            power_value = power_data.get('final_power', 0)
-            max_power = power_data.get('baseline', 1.0)
-            
-            # Normalize power for color
-            power_pct = min(1.0, max(0.0, power_value / max_power if max_power > 0 else 0))
-            
-            # Set uniforms for this panel
-            power_loc = glGetUniformLocation(self.shader_program, "powerPercentage")
-            glUniform1f(power_loc, power_pct)
-            
-            coverage_loc = glGetUniformLocation(self.shader_program, "coverage")
-            glUniform1f(coverage_loc, coverage)
-            
-            # Random highlight center for each panel (simulates different reflection angles)
-            highlight_x = math.sin(x_px * 0.01 + current_time * 0.1) * 0.3
-            highlight_y = math.cos(y_px * 0.01 + current_time * 0.2) * 0.3
-            highlight_loc = glGetUniformLocation(self.shader_program, "highlightCenter")
-            glUniform2f(highlight_loc, highlight_x, highlight_y)
-            
-            # Check if this panel is highlighted
-            is_highlighted = (panel_id == self.highlighted_panel)
-            highlight_loc = glGetUniformLocation(self.shader_program, "isHighlighted")
-            glUniform1i(highlight_loc, int(is_highlighted))
-            
-            # Create model matrix for this panel
-            model_matrix = np.identity(4, dtype=np.float32)
-            
-            # Translate
-            model_matrix[0, 3] = x_px
-            model_matrix[1, 3] = y_px
-            
-            # Scale
-            model_matrix[0, 0] = panel_size_px
-            model_matrix[1, 1] = panel_size_px
-            
-            # Set model matrix uniform
-            model_loc = glGetUniformLocation(self.shader_program, "model")
-            glUniformMatrix4fv(model_loc, 1, GL_FALSE, model_matrix)
-            
-            # Draw panel
-            glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, None)
-            
-            # Draw panel ID if we don't have too many panels
-            # Note: We'd need to use a texture-based approach for text in OpenGL
-            # For simplicity, we'll skip panel IDs in the OpenGL renderer
-        
-        # Clean up
-        glBindVertexArray(0)
-        glUseProgram(0)
-        
-        # Sort affected panels by coverage
-        affected_panels.sort(key=lambda x: x[1], reverse=True)
-        return [panel_id for panel_id, _ in affected_panels]
+        if self.thread_safe_mode:
+            with self._lock:
+                return copy.deepcopy(self.environment_state)
+        else:
+            return copy.deepcopy(self.environment_state)
     
-    def set_highlighted_panel(self, panel_id):
-        """Set which panel should be highlighted"""
-        self.highlighted_panel = panel_id
+    def set_location(self, latitude: float, longitude: float, timezone_offset: float = None):
+        """
+        Set simulation location and update environmental conditions.
+        
+        Args:
+            latitude: Latitude in degrees
+            longitude: Longitude in degrees  
+            timezone_offset: Hours from UTC (auto-calculated if None)
+        """
+        if self.thread_safe_mode:
+            with self._lock:
+                self._set_location_internal(latitude, longitude, timezone_offset)
+        else:
+            self._set_location_internal(latitude, longitude, timezone_offset)
+    
+    def _set_location_internal(self, latitude: float, longitude: float, timezone_offset: Optional[float]):
+        """Internal location setting implementation."""
+        self.latitude = latitude
+        self.longitude = longitude
+        
+        if timezone_offset is not None:
+            self.timezone_offset = timezone_offset
+        else:
+            # Auto-calculate timezone from longitude
+            self.timezone_offset = round(longitude / 15.0)
+        
+        # Update environment state
+        self.environment_state.latitude = latitude
+        self.environment_state.longitude = longitude
+        self.environment_state.timezone_offset = self.timezone_offset
+        
+        # Clear solar position cache
+        self.solar_position_cache.clear()
+        
+        # Recalculate current conditions
+        self._update_solar_position()
+        self._update_atmospheric_conditions()
+        self._update_day_night_cycle()
+        
+        print(f"Location updated: {latitude:.3f}°N, {longitude:.3f}°E, UTC{self.timezone_offset:+.1f}")
+    
+    def set_time_scale(self, time_scale: float):
+        """
+        Set time acceleration factor.
+        
+        Args:
+            time_scale: Time scale factor (1.0 = real time, 60.0 = 1 minute per second)
+        """
+        if self.thread_safe_mode:
+            with self._lock:
+                self.time_scale = max(0.1, min(3600.0, time_scale))
+                self.environment_state.time_scale = self.time_scale
+        else:
+            self.time_scale = max(0.1, min(3600.0, time_scale))
+            self.environment_state.time_scale = self.time_scale
+        
+        print(f"Time scale set to {self.time_scale}x")
+    
+    def set_atmospheric_parameters(self, **kwargs):
+        """
+        Set atmospheric model parameters.
+        
+        Args:
+            **kwargs: Atmospheric parameters (turbidity, water_vapor, ozone, etc.)
+        """
+        if self.thread_safe_mode:
+            with self._lock:
+                self._set_atmospheric_parameters_internal(kwargs)
+        else:
+            self._set_atmospheric_parameters_internal(kwargs)
+    
+    def _set_atmospheric_parameters_internal(self, params: Dict[str, Any]):
+        """Internal atmospheric parameters setting."""
+        for key, value in params.items():
+            if hasattr(self.environment_state, key):
+                setattr(self.environment_state, key, value)
+            elif key in self.atmospheric_params:
+                self.atmospheric_params[key] = value
+        
+        # Recalculate atmospheric conditions
+        self._update_atmospheric_conditions()
+    
+    def get_solar_irradiance_components(self) -> Tuple[float, float, float]:
+        """
+        Get current solar irradiance components.
+        
+        Returns:
+            Tuple of (direct_normal, diffuse_horizontal, global_horizontal) in W/m²
+        """
+        state = self.get_state()
+        return (state.direct_normal_irradiance, 
+                state.diffuse_horizontal_irradiance, 
+                state.global_horizontal_irradiance)
+    
+    def is_daylight(self, threshold: float = 5.0) -> bool:
+        """
+        Check if there is sufficient daylight.
+        
+        Args:
+            threshold: Minimum solar elevation angle for daylight
+            
+        Returns:
+            True if solar elevation above threshold
+        """
+        return self.environment_state.solar_elevation > threshold
+    
+    def get_air_mass(self) -> float:
+        """Get current atmospheric air mass factor."""
+        return self.environment_state.air_mass
+    
+    def get_daylight_factor(self) -> float:
+        """Get current daylight factor (0-1)."""
+        return self.environment_state.daylight_factor
+    
+    def get_performance_stats(self) -> Dict[str, Any]:
+        """Get environmental simulation performance statistics."""
+        current_time = time.time()
+        uptime = current_time - self.simulation_start_time
+        
+        return {
+            'update_count': self.update_count,
+            'uptime_seconds': uptime,
+            'updates_per_second': self.update_count / uptime if uptime > 0 else 0,
+            'cache_size': len(self.solar_position_cache),
+            'simulation_time': self.simulation_time,
+            'time_scale': self.time_scale,
+            'thread_safe_mode': self.thread_safe_mode,
+            'current_conditions': {
+                'solar_elevation': self.environment_state.solar_elevation,
+                'temperature': self.environment_state.ambient_temperature,
+                'humidity': self.environment_state.humidity,
+                'is_daytime': self.environment_state.is_daytime
+            }
+        }
+    
+    def reset_simulation_time(self):
+        """Reset simulation time to start."""
+        if self.thread_safe_mode:
+            with self._lock:
+                self.simulation_time = 0.0
+                self.environment_state.simulation_time = 0.0
+                self.environment_state.current_hour = 12.0  # Reset to noon
+        else:
+            self.simulation_time = 0.0
+            self.environment_state.simulation_time = 0.0
+            self.environment_state.current_hour = 12.0
+    
+    def cleanup(self):
+        """Clean up resources and caches."""
+        if self.thread_safe_mode:
+            with self._lock:
+                self.solar_position_cache.clear()
+        else:
+            self.solar_position_cache.clear()
+        
+        print("BackgroundModule cleanup completed")
 
-
-def initialize_gl_grid_renderer(screen_size):
-    """Initialize OpenGL grid renderer
+# Factory functions for easy creation
+def create_background_module(latitude: float = 6.9271, longitude: float = 79.8612,
+                           **kwargs) -> BackgroundModule:
+    """
+    Factory function to create a BackgroundModule.
     
     Args:
-        screen_size: Tuple of (width, height) in pixels
-    
+        latitude: Site latitude
+        longitude: Site longitude
+        **kwargs: Additional parameters
+        
     Returns:
-        GLGridRenderer instance or None if initialization failed
+        Configured BackgroundModule instance
     """
-    if not OPENGL_AVAILABLE:
-        print("OpenGL not available, cannot initialize GL grid renderer")
-        return None
+    return BackgroundModule(latitude, longitude, **kwargs)
+
+def create_tropical_background_module(**kwargs) -> BackgroundModule:
+    """Create a BackgroundModule optimized for tropical locations."""
+    module = BackgroundModule(latitude=6.9271, longitude=79.8612, **kwargs)
+    
+    # Set tropical-specific parameters
+    module.set_atmospheric_parameters(
+        turbidity=3.0,          # Higher atmospheric turbidity
+        water_vapor=3.0,        # Higher humidity
+        humidity=75.0           # High base humidity
+    )
+    
+    return module
+
+# Testing and validation functions
+def test_background_module():
+    """Test the BackgroundModule functionality."""
+    print("Testing BackgroundModule...")
+    
+    # Create module
+    module = create_background_module()
+    
+    # Test basic functionality
+    print(f"✓ Module created at {module.latitude:.3f}°N, {module.longitude:.3f}°E")
+    
+    # Test state retrieval
+    state = module.get_state()
+    print(f"✓ Current state: {state.ambient_temperature:.1f}°C, "
+          f"Solar elevation: {state.solar_elevation:.1f}°")
+    
+    # Test time progression
+    for i in range(5):
+        module.update(3600.0)  # 1 hour steps
+        state = module.get_state()
+        print(f"  Hour {state.current_hour:.1f}: "
+              f"Temp {state.ambient_temperature:.1f}°C, "
+              f"Solar {state.solar_elevation:.1f}°, "
+              f"Daylight: {'Yes' if state.is_daytime else 'No'}")
+    
+    # Test location change
+    module.set_location(40.7128, -74.0060, -5.0)  # New York
+    state = module.get_state()
+    print(f"✓ Location changed: Solar elevation now {state.solar_elevation:.1f}°")
+    
+    # Test time scale
+    module.set_time_scale(60.0)  # 1 minute real time = 1 hour sim time
+    module.update(60.0)  # 1 minute = 1 hour simulation
+    state = module.get_state()
+    print(f"✓ Time scale test: Hour advanced to {state.current_hour:.1f}")
+    
+    # Test performance
+    stats = module.get_performance_stats()
+    print(f"✓ Performance: {stats['updates_per_second']:.1f} updates/sec, "
+          f"Cache size: {stats['cache_size']}")
+    
+    # Test thread safety
+    module.set_thread_safe_mode(True)
+    for i in range(3):
+        module.update(1.0)
+    print("✓ Thread-safe mode tested")
+    
+    # Cleanup
+    module.cleanup()
+    print("✓ BackgroundModule test completed successfully")
+
+def benchmark_background_module():
+    """Benchmark the BackgroundModule performance."""
+    print("Benchmarking BackgroundModule...")
+    
+    module = create_background_module()
+    
+    # Benchmark update performance
+    iterations = 1000
+    start_time = time.time()
+    
+    for i in range(iterations):
+        module.update(1.0)  # 1 second steps
+    
+    end_time = time.time()
+    total_time = end_time - start_time
+    updates_per_second = iterations / total_time
+    
+    print(f"Update performance: {updates_per_second:.1f} updates/second")
+    print(f"Average update time: {total_time/iterations*1000:.2f} ms")
+    
+    # Benchmark solar position calculation
+    start_time = time.time()
+    for hour in np.arange(0, 24, 0.1):  # Every 6 minutes
+        module.environment_state.current_hour = hour
+        module._update_solar_position()
+    
+    end_time = time.time()
+    calc_time = end_time - start_time
+    
+    print(f"Solar position calculations: {calc_time*1000:.2f} ms for 24 hours")
+    
+    # Test cache performance
+    cache_hits = 0
+    cache_misses = 0
+    
+    for i in range(100):
+        initial_cache_size = len(module.solar_position_cache)
+        module._update_solar_position()
+        final_cache_size = len(module.solar_position_cache)
         
-    try:
-        renderer = GLGridRenderer(screen_size)
-        if not renderer.init_gl():
-            print("Failed to initialize GL grid renderer")
-            return None
-            
-        return renderer
-    except Exception as e:
-        print(f"Error initializing OpenGL grid renderer: {e}")
-        return None
-
-
-def gl_setup_background(screen, grid_renderer, x_range, y_range, width, height):
-    """Draw the background grid with OpenGL
+        if final_cache_size > initial_cache_size:
+            cache_misses += 1
+        else:
+            cache_hits += 1
     
-    Args:
-        screen: Pygame surface (not used for drawing, but needed for API compatibility)
-        grid_renderer: GLGridRenderer instance
-        x_range, y_range: Coordinate ranges in km
-        width, height: Screen dimensions
-    """
-    if grid_renderer is None:
-        print("No GL renderer available, skipping GL grid rendering")
-        return
-        
-    # Clear the screen with sky color
-    glClearColor(0.9, 0.95, 1.0, 1.0)
-    glClear(GL_COLOR_BUFFER_BIT)
+    print(f"Cache performance: {cache_hits}% hits, {cache_misses}% misses")
     
-    # Render grid
-    grid_renderer.render_grid(x_range, y_range, width, height)
+    # Get final stats
+    stats = module.get_performance_stats()
+    print(f"Final stats: {stats}")
     
-    # Note: text rendering in OpenGL is complex and would require texture atlases
-    # For simplicity, we'll skip coordinate labels in OpenGL mode
+    module.cleanup()
+    print("Benchmark completed")
 
-
-def initialize_gl_panel_renderer(screen_size):
-    """Initialize OpenGL panel renderer
-    
-    Args:
-        screen_size: Tuple of (width, height) in pixels
-    
-    Returns:
-        GLPanelRenderer instance or None if initialization failed
-    """
-    if not OPENGL_AVAILABLE:
-        print("OpenGL not available, cannot initialize GL panel renderer")
-        return None
-        
-    try:
-        renderer = GLPanelRenderer(screen_size)
-        if not renderer.init_gl():
-            print("Failed to initialize GL panel renderer")
-            return None
-            
-        return renderer
-    except Exception as e:
-        print(f"Error initializing OpenGL panel renderer: {e}")
-        return None
-
-
-def gl_draw_solar_panels(screen, panel_renderer, panel_df, panel_coverage, power_output, x_range, y_range, width, height):
-    """OpenGL wrapper for drawing solar panels
-    
-    Args:
-        screen: Pygame screen surface
-        panel_renderer: GLPanelRenderer instance
-        panel_df: DataFrame with panel information
-        panel_coverage: Dictionary mapping panel_id to coverage (0-1)
-        power_output: Dictionary mapping panel_id to power output information
-        x_range, y_range: Coordinate ranges in km
-        width, height: Screen dimensions
-    
-    Returns:
-        List of affected panel IDs sorted by coverage
-    """
-    if panel_renderer is None:
-        print("No GL renderer available, skipping GL panel rendering")
-        return []
-        
-    return panel_renderer.render_panels(panel_df, panel_coverage, power_output, x_range, y_range, width, height)
-
-
-# Alias for compatibility with main.py
-setup_background_fast = setup_background
+if __name__ == "__main__":
+    test_background_module()
+    benchmark_background_module()
