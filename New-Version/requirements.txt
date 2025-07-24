@@ -1,0 +1,9 @@
+numpy
+pandas
+pygame
+matplotlib
+scipy
+rtree
+numba
+PyOpenGL
+PyOpenGL_accelerate
